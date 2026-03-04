@@ -1,0 +1,27 @@
+name: Analyze New Entries (Transcripts + AI)
+
+on:
+  schedule:
+    - cron: "10 4 * * *"  # 台灣12:10，讓daily榜單先跑完
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run analyzer
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
+          # 先留空：你之後要接哪家 AI 再加
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python analyze_pending.py
