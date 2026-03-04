@@ -211,7 +211,9 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "variant_title": {"type": "string"},
-                        "variables": {"type": "object"},
+                        "variables": {
+                            "type": "object",
+                            "additionalProperties": False
                         "voiceover": {"type": "string"},
                         "on_screen_text": {"type": "array", "items": {"type": "string"}},
                         "video_prompt": {"type": "string"},
