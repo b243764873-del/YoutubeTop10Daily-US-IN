@@ -1,4 +1,4 @@
-name: Generate AI Meme Shorts (Image + TTS + YouTube Metadata)
+name: Generate AI Meme Shorts (Sora video + TTS + Safe Subs)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
 jobs:
   generate:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "openai>=1.55.0" gspread google-auth
 
-      - name: Run generator
+      - name: Run generator (Sora)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
@@ -43,26 +44,23 @@ jobs:
           TTS_MODEL: gpt-4o-mini-tts
           TTS_VOICE: alloy
 
-          # Image
-          IMG_MODEL: gpt-image-1
-          IMG_SIZE: 1024x1536
-          IMG_QUALITY: medium
-          IMG_OUTPUT_FORMAT: png
+          # Sora / Videos API
+          VIDEO_MODEL: sora-2
+          VIDEO_SIZE_PRIMARY: 720x1280
+          VIDEO_SIZE_FALLBACK: 1280x720
+          POLL_INTERVAL_SEC: 10
+          VIDEO_CREATE_TIMEOUT_SEC: 600
 
-          # Video
-          VIDEO_W: 1080
-          VIDEO_H: 1920
+          # Output (force 9:16)
+          OUT_W: 1080
+          OUT_H: 1920
           FPS: 30
           MAX_DURATION_SEC: 20
 
-          # Subs (bottom)
-          SUB_MARGIN_V: 220
-          SUB_FONT_SIZE: 84
-
-          # YouTube metadata
-          YT_MODEL: gpt-4.1-mini
-          YT_LANG: en
-          YT_MAX_TITLE_CHARS: 70
+          # Safe subtitles
+          SUB_MARGIN_V: 280
+          SUB_FONT_SIZE: 68
+          SUB_MAX_CHARS_PER_LINE: 18
 
         run: |
           python generate_meme_video.py
@@ -70,5 +68,5 @@ jobs:
       - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
-          name: ai-meme-shorts
+          name: sora-meme-shorts
           path: outputs/*.mp4
