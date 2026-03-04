@@ -95,14 +95,34 @@ def clamp_duration(d: float) -> float:
 
 
 def make_tts_mp3(client: OpenAI, text: str, out_path: str):
-    # OpenAI Python SDK supports write_to_file on the response
+    # Compatible across OpenAI python versions:
+    # - Some versions use response_format instead of format
+    # - Some return a response with write_to_file()
+    # - Some expose raw bytes via .content / .read()
     resp = client.audio.speech.create(
         model=TTS_MODEL,
         voice=TTS_VOICE,
         input=text,
-        format="mp3",
+        response_format="mp3",
     )
-    resp.write_to_file(out_path)
+
+    # Prefer SDK helper if available
+    if hasattr(resp, "write_to_file"):
+        resp.write_to_file(out_path)
+        return
+
+    # Fallbacks
+    data = None
+    if hasattr(resp, "content"):
+        data = resp.content
+    elif hasattr(resp, "read"):
+        data = resp.read()
+
+    if not data:
+        raise RuntimeError("TTS response has no writable audio bytes (no write_to_file/content/read).")
+
+    with open(out_path, "wb") as f:
+        f.write(data)
 
 
 def build_ass_subtitles(lines: List[str], total_dur: float, ass_path: str):
