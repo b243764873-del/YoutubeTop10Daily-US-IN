@@ -13,7 +13,7 @@ from openai import OpenAI
 
 
 # =========================
-# Config (via env)
+# Config (env)
 # =========================
 SHEET_NAME = os.getenv("SHEET_NAME", "daily_rank")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -22,8 +22,7 @@ MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "5"))
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
 SLEEP_BETWEEN_ROWS_SEC = float(os.getenv("SLEEP_BETWEEN_ROWS_SEC", "0.8"))
 
-# Keep small for stability, then increase later
-VARIANT_COUNT = int(os.getenv("VARIANT_COUNT", "3"))
+VARIANT_COUNT = int(os.getenv("VARIANT_COUNT", "3"))  # increase to 10 after stable
 
 
 # =========================
@@ -60,9 +59,6 @@ def safe_truncate(text: str, max_chars: int) -> str:
 
 
 def parse_retry_delay_seconds(err_text: str) -> int | None:
-    """
-    Parses 'Please retry in XXs' if present.
-    """
     t = err_text or ""
     import re
     m = re.search(r"retry in\s+(\d+)(?:\.\d+)?s", t, flags=re.IGNORECASE)
@@ -75,9 +71,6 @@ def parse_retry_delay_seconds(err_text: str) -> int | None:
 
 
 def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, dict]:
-    """
-    Returns (text, meta). meta may contain error.
-    """
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
 
@@ -104,9 +97,6 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
 
 
 def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str]:
-    """
-    Fetches top comments; returns [] on any error to avoid blocking.
-    """
     try:
         res = youtube.commentThreads().list(
             part="snippet",
@@ -131,9 +121,6 @@ def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str
 
 
 def build_json_schema(variant_count: int) -> Dict[str, Any]:
-    """
-    Strict JSON schema: forces valid JSON output and reduces parse failures.
-    """
     return {
         "type": "object",
         "additionalProperties": False,
@@ -247,7 +234,7 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
     }
 
 
-def openai_breakdown_jsonschema(
+def openai_breakdown_jsonschema_chat(
     client: OpenAI,
     title: str,
     transcript: str,
@@ -256,7 +243,7 @@ def openai_breakdown_jsonschema(
     variant_count: int,
 ) -> Dict[str, Any]:
     """
-    Uses response_format json_schema to force valid JSON.
+    OpenAI Python 2.x compatible: Chat Completions with response_format json_schema.
     """
     schema = build_json_schema(variant_count)
 
@@ -273,16 +260,12 @@ def openai_breakdown_jsonschema(
         "transcript": safe_truncate(transcript, 2500) if transcript else "(no transcript available)",
         "top_comments": comments[:20],
         "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16", "variant_count": variant_count},
-        "output_rules": {
-            "must_be_original": True,
-            "no_verbatim_copy": True,
-            "max_duration_sec": 20
-        }
     }
 
-    resp = client.responses.create(
+    # ✅ Chat Completions structured output
+    resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        max_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -291,15 +274,14 @@ def openai_breakdown_jsonschema(
                 "strict": True,
             },
         },
-        input=[
+        messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
     )
 
-    raw = (resp.output_text or "").strip()
-    # With json_schema strict, this should be valid JSON.
-    return json.loads(raw)
+    content = (resp.choices[0].message.content or "").strip()
+    return json.loads(content)
 
 
 def openai_with_retry(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
@@ -309,7 +291,7 @@ def openai_with_retry(client: OpenAI, title: str, transcript: str, comments: Lis
 
     for i in range(1, attempts + 1):
         try:
-            return openai_breakdown_jsonschema(
+            return openai_breakdown_jsonschema_chat(
                 client=client,
                 title=title,
                 transcript=transcript,
@@ -337,7 +319,7 @@ def main():
     yt_key = os.environ["YOUTUBE_API_KEY"]
 
     youtube = yt_client(yt_key)
-    client = OpenAI()  # reads OPENAI_API_KEY from env
+    client = OpenAI()
 
     gc = gsheet_client_from_sa_json(sa_json)
     sh = gc.open_by_key(sheet_id)
@@ -377,7 +359,6 @@ def main():
         flush=True
     )
 
-    # Column indices
     c_status = idx["ai_status"]
     c_cat = idx["ai_category"]
     c_gen = idx["ai_generatable"]
@@ -399,12 +380,10 @@ def main():
 
         print(f"[INFO] start row={rnum} video_id={video_id} region={region}", flush=True)
 
-        # Transcript
         prefer_langs = ("en", "hi") if region == "IN" else ("en",)
         transcript, meta = get_transcript_text(video_id, prefer_langs=prefer_langs)
         transcript = safe_truncate(transcript, 4000)
 
-        # Comments
         comments = get_top_comments(youtube, video_id, max_comments=20)
 
         try:
