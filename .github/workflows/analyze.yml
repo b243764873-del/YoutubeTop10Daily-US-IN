@@ -2,16 +2,18 @@ name: Analyze New Entries (V3 - OpenAI)
 
 on:
   schedule:
-    - cron: "10 4 * * *"  # Taiwan 12:10
+    - cron: "10 4 * * *" # Taiwan 12:10 (UTC+8)
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -20,8 +22,18 @@ jobs:
 
       - name: Run analyzer
         env:
+          # Required
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
+
+          # Tuning knobs (optional)
+          SHEET_NAME: daily_rank
+          MAX_PER_RUN: 5
+          VARIANT_COUNT: 3
+          OPENAI_MODEL: gpt-4.1-mini
+          OPENAI_MAX_OUTPUT_TOKENS: 1200
+          OPENAI_TIMEOUT_SEC: 75
+          SLEEP_BETWEEN_ROWS_SEC: 0.8
         run: python analyze_pending.py
