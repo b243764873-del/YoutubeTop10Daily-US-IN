@@ -16,24 +16,20 @@ from google.oauth2.service_account import Credentials
 # =========================
 REGIONS = ["US", "IN"]
 
-# You want: <=20 seconds, published within last 3 days, sort by views desc
 MAX_DURATION_SEC = 20
 PUBLISHED_WITHIN_DAYS = 3
 TOP_N = 10
 
-# To avoid "not enough candidates" due to strict filters, we gather more candidates.
-# Each search() call returns up to 50. We'll do multiple rounds and de-duplicate.
+# Multi-round search to gather enough candidates, then filter ourselves.
 SEARCH_ROUNDS = [
-    # (q, order)
     ("#shorts", "viewCount"),
     ("shorts", "viewCount"),
     ("#shorts", "date"),
     ("shorts", "date"),
 ]
 
-# How many ids we aim to collect before fetching details
 TARGET_CANDIDATE_IDS = 200
-MAX_TOTAL_CANDIDATE_IDS = 400  # hard cap to control quota/time
+MAX_TOTAL_CANDIDATE_IDS = 400  # hard cap (quota/time guard)
 
 
 # =========================
@@ -54,7 +50,8 @@ def iso8601_to_seconds(duration: str) -> int | None:
 
 def probable_shorts(title: str, desc: str) -> bool:
     """
-    Not perfect, but helps accuracy. You can relax/remove this if you want more results.
+    Heuristic to improve Shorts accuracy.
+    If you feel results are too few, you can relax this function later.
     """
     t = (title or "").lower()
     d = (desc or "").lower()
@@ -79,8 +76,8 @@ def yt_client(api_key: str):
 def search_video_ids(youtube, region: str) -> List[str]:
     """
     Collect candidate video IDs using multiple search rounds.
-    Note: search.list can't filter <=20s; it only supports videoDuration=short (<4min),
-    so we collect candidates, then filter by videos.list duration <=20s.
+    search.list can't filter <=20s; it only supports videoDuration=short (<4min),
+    so we gather candidates, then filter by videos.list duration <=20s.
     """
     seen = set()
     ids: List[str] = []
@@ -100,18 +97,15 @@ def search_video_ids(youtube, region: str) -> List[str]:
                 maxResults=50,
             ).execute()
         except HttpError as e:
-            # If quota or any error, break early
             print(f"[WARN] search.list failed for region={region}, q={q}, order={order}: {e}")
             break
 
-        items = res.get("items", [])
-        for it in items:
+        for it in res.get("items", []):
             vid = it.get("id", {}).get("videoId")
             if not vid or vid in seen:
                 continue
             seen.add(vid)
             ids.append(vid)
-
             if len(ids) >= MAX_TOTAL_CANDIDATE_IDS:
                 break
 
@@ -140,11 +134,12 @@ def fetch_videos_details(youtube, video_ids: List[str]) -> List[Dict]:
 
 def build_top_list(youtube, region: str) -> List[Dict]:
     """
-    Build Top10 list for a region with filters:
+    Build Top list for a region with filters:
     - duration <= 20s
     - published within last 3 days
-    - probable shorts (optional heuristic)
-    Sort by views desc and return top N.
+    - probable shorts (heuristic)
+    Sort by views desc and return up to TOP_N.
+    If fewer than TOP_N, we return what we have (your choice A).
     """
     ids = search_video_ids(youtube, region=region)
     if not ids:
@@ -157,12 +152,9 @@ def build_top_list(youtube, region: str) -> List[Dict]:
 
     rows: List[Dict] = []
     for it in items:
-        try:
-            sn = it["snippet"]
-            cd = it["contentDetails"]
-            st = it.get("statistics", {})
-        except KeyError:
-            continue
+        sn = it.get("snippet") or {}
+        cd = it.get("contentDetails") or {}
+        st = it.get("statistics") or {}
 
         dur = iso8601_to_seconds(cd.get("duration", ""))
         if dur is None or dur > MAX_DURATION_SEC:
@@ -178,25 +170,34 @@ def build_top_list(youtube, region: str) -> List[Dict]:
         title = sn.get("title", "")
         desc = sn.get("description", "")
 
-        # Optional heuristic: keep it for better Shorts accuracy
+        # Heuristic (optional)
         if not probable_shorts(title, desc):
             continue
 
         views = int(st.get("viewCount", 0))
+        vid = it.get("id")
+        if not vid:
+            continue
+
         rows.append(
             {
-                "video_id": it.get("id"),
+                "video_id": vid,
                 "title": title,
                 "channel_title": sn.get("channelTitle", ""),
                 "published_at": published_at,
                 "views": views,
                 "duration_sec": dur,
-                "video_url": f"https://www.youtube.com/watch?v={it.get('id')}",
+                "video_url": f"https://www.youtube.com/watch?v={vid}",
             }
         )
 
     rows.sort(key=lambda x: x["views"], reverse=True)
-    return rows[:TOP_N]
+    result = rows[:TOP_N]
+
+    if len(result) < TOP_N:
+        print(f"[INFO] region={region} only found {len(result)}/{TOP_N} videos matching filters (<=20s, last 3 days).")
+
+    return result
 
 
 # =========================
@@ -232,26 +233,30 @@ def get_or_create_worksheet(sh, title: str):
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=1000, cols=len(HEADERS))
+        ws = sh.add_worksheet(title=title, rows=2000, cols=len(HEADERS))
         return ws
 
 
 def ensure_headers(ws):
-    """
-    If sheet is empty, write headers. If first row doesn't match, still overwrite first row.
-    """
     first_row = ws.row_values(1)
     if first_row != HEADERS:
-        ws.update("A1:O1", [HEADERS])
+        ws.update(f"A1:{chr(ord('A') + len(HEADERS) - 1)}1", [HEADERS])
+
+
+def already_written_today(ws, today_str: str, region: str) -> bool:
+    """
+    Prevent duplicate appends when you manually run workflow multiple times.
+    """
+    records = ws.get_all_records()
+    return any(r.get("date") == today_str and r.get("region") == region for r in records)
 
 
 def load_previous_date_ids(ws, today_str: str, region: str) -> Tuple[set, str | None]:
     """
     Load the most recent previous date (< today_str) for the given region,
     and return its video_id set.
-    This uses get_all_records() for simplicity.
     """
-    records = ws.get_all_records()  # expects headers in row1
+    records = ws.get_all_records()
     dates = sorted({r.get("date") for r in records if r.get("region") == region and r.get("date")})
     if not dates:
         return set(), None
@@ -267,20 +272,15 @@ def load_previous_date_ids(ws, today_str: str, region: str) -> Tuple[set, str | 
     return prev_ids, prev_date
 
 
-def append_daily_rank(ws, rows: List[List]):
-    """
-    Append rows at the end.
-    """
-    if not rows:
-        return
-    ws.append_rows(rows, value_input_option="RAW")
+def append_rows(ws, rows: List[List]):
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
 
 
 # =========================
 # Main
 # =========================
 def main():
-    # Required env vars
     yt_key = os.environ["YOUTUBE_API_KEY"]
     sheet_id = os.environ["GSHEET_ID"]
     sa_json = os.environ["GSHEET_SA_JSON"]
@@ -297,9 +297,13 @@ def main():
     all_append_rows: List[List] = []
 
     for region in REGIONS:
+        if already_written_today(ws, today_str, region):
+            print(f"[INFO] region={region} already written for {today_str}, skip.")
+            continue
+
         top_list = build_top_list(youtube, region)
         if not top_list:
-            print(f"[WARN] No results for region={region}. Try relaxing probable_shorts() filter.")
+            print(f"[WARN] No results for region={region}. If this happens often, relax probable_shorts().")
             continue
 
         prev_ids, prev_date = load_previous_date_ids(ws, today_str, region)
@@ -307,8 +311,6 @@ def main():
 
         for idx, v in enumerate(top_list, start=1):
             is_new = (v["video_id"] not in prev_ids)
-
-            # New entries -> pending for AI analysis later
             ai_status = "pending" if is_new else ""
 
             all_append_rows.append(
@@ -331,7 +333,7 @@ def main():
                 ]
             )
 
-    append_daily_rank(ws, all_append_rows)
+    append_rows(ws, all_append_rows)
     print(f"[DONE] appended rows: {len(all_append_rows)}")
 
 
