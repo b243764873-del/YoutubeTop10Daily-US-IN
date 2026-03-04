@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timezone
+from typing import List, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -8,23 +8,6 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 
 
 SHEET_NAME = "daily_rank"
-COLS = {
-    "date": "A",
-    "region": "B",
-    "rank": "C",
-    "video_id": "D",
-    "title": "E",
-    "channel_title": "F",
-    "views": "G",
-    "published_at": "H",
-    "duration_sec": "I",
-    "is_new": "J",
-    "video_url": "K",
-    "ai_status": "L",
-    "ai_hook": "M",
-    "ai_script_template": "N",
-    "ai_prompt_pack_json": "O",
-}
 
 
 def gsheet_client_from_sa_json(sa_json_str: str):
@@ -34,20 +17,29 @@ def gsheet_client_from_sa_json(sa_json_str: str):
     return gspread.authorize(creds)
 
 
-def find_header_indices(header_row):
-    # header_row is list of header strings
-    idx = {name: (i + 1) for i, name in enumerate(header_row)}  # 1-based
-    return idx
+def find_header_indices(header_row: List[str]):
+    # header_row is list of header strings; return 1-based indices
+    return {name: (i + 1) for i, name in enumerate(header_row)}
 
 
-def get_transcript_text(video_id: str, prefer_langs=("en", "hi")):
+def a1_col(n: int) -> str:
+    """1->A, 2->B ... 27->AA"""
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, dict]:
     """
-    Try to get transcript. For US/IN we try English/Hindi first, then any.
-    Returns (text, meta) where meta includes language and is_generated.
+    Try to get transcript for a video.
+    Returns (text, meta). meta may contain error.
     """
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        # Try preferred languages first
+
+        # preferred languages first
         for lang in prefer_langs:
             try:
                 t = transcripts.find_transcript([lang])
@@ -57,16 +49,7 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")):
             except Exception:
                 pass
 
-        # Fallback: pick first available transcript (manual preferred if possible)
-        try:
-            t = transcripts.find_manually_created_transcript(transcripts._TranscriptList__langs)  # internal; may fail
-            segs = t.fetch()
-            text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
-            return text, {"lang": t.language_code, "is_generated": getattr(t, "is_generated", None)}
-        except Exception:
-            pass
-
-        # Otherwise pick first transcript
+        # fallback: first available
         for t in transcripts:
             segs = t.fetch()
             text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
@@ -82,12 +65,12 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")):
 
 def analyze_to_hook_and_templates(title: str, transcript: str):
     """
-    先做一個「不依賴外部AI」的臨時版本：
-    - 取 title + transcript 前幾句，給你可手動用的摘要
-    之後你選 AI 供應商，我再幫你把這個函式改成真的呼叫 AI。
+    Temporary non-AI analyzer (safe & free):
+    Later you can replace this with an AI call.
     """
-    t = transcript.strip()
+    t = (transcript or "").strip()
     snippet = t[:220] + ("..." if len(t) > 220 else "")
+
     hook = f"Hook idea: {title.strip()}"
     script_template = (
         "0-2s: [Hook]\n"
@@ -97,9 +80,9 @@ def analyze_to_hook_and_templates(title: str, transcript: str):
         f"\nTranscript snippet: {snippet}"
     )
     prompt_pack = {
-        "voiceover_prompt": "Write a 18-20s voiceover script using the structure above. Keep it original, do not copy phrases.",
+        "voiceover_prompt": "Write an 18-20s voiceover using the structure above. Keep it original; do not copy phrases.",
         "video_prompt": "Create a vertical 9:16 short video, fast cuts, big subtitles, 18-20 seconds.",
-        "subtitle_prompt": "Generate concise subtitles, <=12 chars per line where possible, emphasize keywords.",
+        "subtitle_prompt": "Generate concise subtitles; emphasize keywords; keep lines short.",
     }
     return hook, script_template, json.dumps(prompt_pack, ensure_ascii=False)
 
@@ -115,52 +98,57 @@ def main():
     header = ws.row_values(1)
     idx = find_header_indices(header)
 
-    # Read all rows (simple & reliable for early stage)
-    rows = ws.get_all_values()
-    if len(rows) <= 1:
+    required_cols = ["ai_status", "ai_hook", "ai_script_template", "ai_prompt_pack_json", "video_id", "title", "region"]
+    for c in required_cols:
+        if c not in idx:
+            raise RuntimeError(f"Missing header column: {c}. Please ensure daily_rank headers are correct.")
+
+    # Load all values once
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= 1:
         print("[INFO] No data rows.")
         return
 
-    # Identify pending rows
-    # ai_status column name is "ai_status" in your headers
-    ai_status_col = idx.get("ai_status")
-    video_id_col = idx.get("video_id")
-    title_col = idx.get("title")
-    region_col = idx.get("region")
-
-    if not all([ai_status_col, video_id_col, title_col, region_col]):
-        raise RuntimeError("Missing expected headers in row 1. Ensure daily_rank headers match.")
-
-    pending_row_numbers = []
-    for rnum in range(2, len(rows) + 1):  # sheet row numbers
-        row = rows[rnum - 1]
-        status = row[ai_status_col - 1].strip() if len(row) >= ai_status_col else ""
+    pending_rnums = []
+    for rnum in range(2, len(all_rows) + 1):
+        row = all_rows[rnum - 1]
+        status = row[idx["ai_status"] - 1].strip() if len(row) >= idx["ai_status"] else ""
         if status == "pending":
-            pending_row_numbers.append(rnum)
+            pending_rnums.append(rnum)
 
-    if not pending_row_numbers:
+    if not pending_rnums:
         print("[INFO] No pending rows.")
         return
 
-    print(f"[INFO] Pending rows: {len(pending_row_numbers)}")
+    print(f"[INFO] Pending rows: {len(pending_rnums)}")
 
-    # Process each pending row
-    for rnum in pending_row_numbers:
-        row = ws.row_values(rnum)
-        video_id = row[video_id_col - 1].strip()
-        title = row[title_col - 1].strip()
-        region = row[region_col - 1].strip()
+    # We'll batch update these columns for each pending row:
+    # ai_status, ai_hook, ai_script_template, ai_prompt_pack_json
+    c_status = idx["ai_status"]
+    c_hook = idx["ai_hook"]
+    c_script = idx["ai_script_template"]
+    c_pack = idx["ai_prompt_pack_json"]
 
-        # prefer languages by region
+    # Prepare values in row order for a single rectangular range update:
+    # From min_row..max_row and from min_col..max_col
+    min_row = min(pending_rnums)
+    max_row = max(pending_rnums)
+    min_col = min(c_status, c_hook, c_script, c_pack)
+    max_col = max(c_status, c_hook, c_script, c_pack)
+
+    # Build a map rnum -> (status, hook, script, pack)
+    updates = {}
+    for rnum in pending_rnums:
+        row = all_rows[rnum - 1]
+        video_id = row[idx["video_id"] - 1].strip()
+        title = row[idx["title"] - 1].strip()
+        region = row[idx["region"] - 1].strip()
+
         prefer_langs = ("en", "hi") if region == "IN" else ("en",)
-
         transcript, meta = get_transcript_text(video_id, prefer_langs=prefer_langs)
 
         hook, script_template, prompt_pack_json = analyze_to_hook_and_templates(title, transcript)
 
-        # Write back to sheet
-        # ai_hook (M), ai_script_template (N), ai_prompt_pack_json (O)
-        # ai_status -> done / no_transcript / failed
         if meta.get("error") == "no_transcript":
             new_status = "no_transcript"
         elif meta.get("error"):
@@ -168,14 +156,29 @@ def main():
         else:
             new_status = "done"
 
-        ws.update_cell(rnum, idx["ai_status"], new_status)
-        ws.update_cell(rnum, idx["ai_hook"], hook)
-        ws.update_cell(rnum, idx["ai_script_template"], script_template)
-        ws.update_cell(rnum, idx["ai_prompt_pack_json"], prompt_pack_json)
+        updates[rnum] = {
+            c_status: new_status,
+            c_hook: hook,
+            c_script: script_template,
+            c_pack: prompt_pack_json,
+        }
+        print(f"[OK] prepared row={rnum} video_id={video_id} status={new_status}")
 
-        print(f"[OK] row={rnum} video_id={video_id} status={new_status}")
+    # Create a 2D array for the whole rectangle [min_row..max_row] x [min_col..max_col]
+    values = []
+    for rnum in range(min_row, max_row + 1):
+        row_vals = []
+        for c in range(min_col, max_col + 1):
+            if rnum in updates and c in updates[rnum]:
+                row_vals.append(updates[rnum][c])
+            else:
+                row_vals.append("")  # leave blank for non-pending rows inside the rectangle
+        values.append(row_vals)
 
-    print("[DONE] analysis complete.")
+    a1_range = f"{a1_col(min_col)}{min_row}:{a1_col(max_col)}{max_row}"
+    ws.update(a1_range, values, value_input_option="RAW")
+
+    print(f"[DONE] Batch updated range {a1_range} for {len(pending_rnums)} pending rows.")
 
 
 if __name__ == "__main__":
