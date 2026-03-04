@@ -450,7 +450,17 @@ def main():
 
                     # 2) Duration (follow TTS, cap 20s)
                     dur = clamp_duration(audio_duration_sec(tts_path))
-                    seconds = int(max(4, min(20, round(dur))))
+
+                    # Sora supports only fixed durations: 4, 8, 12 seconds
+                    if dur <= 6:
+                        seconds = 4
+                    elif dur <= 10:
+                        seconds = 8
+                    else:
+                        seconds = 12
+
+# Ensure final render duration doesn't exceed generated video length
+dur = min(dur, float(seconds))
 
                     # 3) ASS subtitles (safe, wrapped, no placeholders)
                     build_ass_subtitles_bottom(on_screen, dur, ass_path)
