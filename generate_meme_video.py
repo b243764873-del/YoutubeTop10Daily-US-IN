@@ -1,9 +1,9 @@
 import os
 import json
 import time
-import base64
+import re
 import subprocess
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,34 +17,30 @@ SHEET_NAME = os.getenv("SHEET_NAME", "daily_rank")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
 
 MAX_PER_RUN_GEN = int(os.getenv("MAX_PER_RUN_GEN", "2"))
-VARIANT_INDEX = int(os.getenv("GEN_VARIANT_INDEX", "0"))  # which variant to use
-
+VARIANT_INDEX = int(os.getenv("GEN_VARIANT_INDEX", "0"))
 RETRY_FAILED = os.getenv("RETRY_FAILED", "0") == "1"
 
 # TTS
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 
-# Image generation
-IMG_MODEL = os.getenv("IMG_MODEL", "gpt-image-1")
-IMG_SIZE = os.getenv("IMG_SIZE", "1024x1536")  # vertical-friendly
-IMG_QUALITY = os.getenv("IMG_QUALITY", "medium")
-IMG_OUTPUT_FORMAT = os.getenv("IMG_OUTPUT_FORMAT", "png")  # png/webp/jpeg
+# Video generation (Sora / Videos API)
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "sora-2")
+VIDEO_SIZE_PRIMARY = os.getenv("VIDEO_SIZE_PRIMARY", "720x1280")   # try vertical first
+VIDEO_SIZE_FALLBACK = os.getenv("VIDEO_SIZE_FALLBACK", "1280x720") # fallback to landscape then crop to vertical
+POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "10"))
+VIDEO_CREATE_TIMEOUT_SEC = float(os.getenv("VIDEO_CREATE_TIMEOUT_SEC", "600"))  # max wait per video job
 
-# Video
-VIDEO_W = int(os.getenv("VIDEO_W", "1080"))
-VIDEO_H = int(os.getenv("VIDEO_H", "1920"))
+# Output video
+OUT_W = int(os.getenv("OUT_W", "1080"))
+OUT_H = int(os.getenv("OUT_H", "1920"))
 FPS = int(os.getenv("FPS", "30"))
 MAX_DURATION_SEC = float(os.getenv("MAX_DURATION_SEC", "20.0"))
 
-# Subtitles (bottom-center)
-SUB_MARGIN_V = int(os.getenv("SUB_MARGIN_V", "220"))
-SUB_FONT_SIZE = int(os.getenv("SUB_FONT_SIZE", "84"))
-
-# YouTube metadata
-YT_MODEL = os.getenv("YT_MODEL", "gpt-4.1-mini")
-YT_LANG = os.getenv("YT_LANG", "en")  # en / hi / etc (for now you chose A=English)
-YT_MAX_TITLE_CHARS = int(os.getenv("YT_MAX_TITLE_CHARS", "70"))
+# Subtitles safe area
+SUB_MARGIN_V = int(os.getenv("SUB_MARGIN_V", "280"))  # increase margin to avoid out-of-frame
+SUB_FONT_SIZE = int(os.getenv("SUB_FONT_SIZE", "68")) # smaller than before
+SUB_MAX_CHARS_PER_LINE = int(os.getenv("SUB_MAX_CHARS_PER_LINE", "18"))
 
 
 # =========================
@@ -111,14 +107,44 @@ def a1_col(n: int) -> str:
 
 
 # =========================
-# OpenAI helpers (version-tolerant)
+# Text sanitize / wrap
+# =========================
+def sanitize_caption(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s)
+    # remove placeholders like [TOPIC], [NUMBER], {TOPIC}
+    s = re.sub(r"\[[^\]]+\]", "", s)
+    s = re.sub(r"\{[^}]+\}", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def wrap_caption(text: str, max_chars: int = 18) -> str:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    # split at nearest whitespace before max_chars
+    cut = max_chars
+    for i in range(max_chars, max(8, max_chars - 7), -1):
+        if i < len(text) and text[i] == " ":
+            cut = i
+            break
+    left = text[:cut].strip()
+    right = text[cut:].strip()
+    if not right:
+        return left
+    return left + r"\N" + right
+
+
+# =========================
+# OpenAI helpers
 # =========================
 def make_tts_mp3(client: OpenAI, text: str, out_path: str):
     """
     Version-tolerant TTS:
     - Prefer response_format="mp3"
     - Fallback to format="mp3"
-    - Use write_to_file if available; else bytes fallback
     """
     resp = None
     try:
@@ -147,125 +173,81 @@ def make_tts_mp3(client: OpenAI, text: str, out_path: str):
         data = resp.read()
 
     if not data:
-        raise RuntimeError("TTS response has no audio bytes (no write_to_file/content/read).")
-
+        raise RuntimeError("TTS response has no audio bytes.")
     with open(out_path, "wb") as f:
         f.write(data)
 
 
-def generate_ai_image(client: OpenAI, prompt: str, out_path: str) -> Dict[str, Any]:
-    resp = client.images.generate(
-        model=IMG_MODEL,
-        prompt=prompt,
-        size=IMG_SIZE,
-        quality=IMG_QUALITY,
-        output_format=IMG_OUTPUT_FORMAT,
-    )
-
-    b64 = None
-    revised = None
-    if getattr(resp, "data", None) and len(resp.data) > 0:
-        item = resp.data[0]
-        b64 = getattr(item, "b64_json", None) or (item.get("b64_json") if isinstance(item, dict) else None)
-        revised = getattr(item, "revised_prompt", None) or (item.get("revised_prompt") if isinstance(item, dict) else None)
-
-    if not b64:
-        raise RuntimeError("Image API returned no b64_json.")
-
-    with open(out_path, "wb") as f:
-        f.write(base64.b64decode(b64))
-
-    return {
-        "revised_prompt": revised,
-        "model": IMG_MODEL,
-        "size": IMG_SIZE,
-        "quality": IMG_QUALITY,
-        "format": IMG_OUTPUT_FORMAT,
-    }
-
-
-def generate_youtube_metadata(client: OpenAI, variant: Dict[str, Any], region: str) -> Dict[str, Any]:
+def sora_create_and_download_mp4(
+    client: OpenAI,
+    prompt: str,
+    seconds: int,
+    size_primary: str,
+    size_fallback: str,
+    out_raw_mp4: str,
+) -> Tuple[str, str]:
     """
-    Return JSON:
-    {
-      "title": "...",
-      "description": "...",
-      "hashtags": ["#shorts", ...],
-      "tags": ["...", ...]
-    }
+    Creates a video job with Videos API and downloads mp4.
+
+    Returns (used_size, video_id)
     """
-    voiceover = str(variant.get("voiceover", "")).strip()
-    ons = variant.get("on_screen_text", []) or []
-    ons = [str(x).strip() for x in ons if str(x).strip()][:3]
-    vtitle = str(variant.get("variant_title", "")).strip()
+    last_err = None
+    for size in [size_primary, size_fallback]:
+        try:
+            start_ts = time.time()
+            video = client.videos.create(
+                model=VIDEO_MODEL,
+                prompt=prompt,
+                size=size,
+                seconds=str(seconds),
+            )
+            vid = video.id
+            status = getattr(video, "status", None)
+            progress = getattr(video, "progress", None)
 
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "hashtags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 6},
-            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 6, "maxItems": 18},
-        },
-        "required": ["title", "description", "hashtags", "tags"],
-    }
+            while status in ("queued", "in_progress"):
+                if time.time() - start_ts > VIDEO_CREATE_TIMEOUT_SEC:
+                    raise RuntimeError(f"Sora timeout > {VIDEO_CREATE_TIMEOUT_SEC}s (video_id={vid}, status={status}, progress={progress})")
+                time.sleep(POLL_INTERVAL_SEC)
+                video = client.videos.retrieve(vid)
+                status = getattr(video, "status", None)
+                progress = getattr(video, "progress", None)
 
-    instruction = f"""
-You are a YouTube Shorts copywriter.
+            if status != "completed":
+                msg = getattr(getattr(video, "error", None), "message", None)
+                raise RuntimeError(f"Sora failed status={status} msg={msg}")
 
-Write metadata for a MEME-style Shorts video.
-Language: {YT_LANG} (keep it natural for US audience).
-Max title length: {YT_MAX_TITLE_CHARS} characters.
+            # Download MP4 bytes
+            content = client.videos.download_content(vid, variant="video")
+            content.write_to_file(out_raw_mp4)
 
-Rules:
-- Title: short, hooky, 1 emoji max, MUST include "#shorts" at the end.
-- Do not use copyrighted character names, brands, or real person names.
-- Description: 2 short lines + a simple CTA (e.g., "Follow for more.") + hashtags on last line.
-- Hashtags: 3-6, include "#shorts" and 1-2 topical hashtags.
-- Tags: 6-18 short keywords, no hashtags inside tags.
-- Keep it safe and general (no harassment, no slurs).
-Return STRICT JSON only.
-""".strip()
+            return size, vid
 
-    user_payload = {
-        "region": region,
-        "variant_title": vtitle,
-        "voiceover": voiceover[:600],
-        "on_screen_text": ons,
-    }
+        except Exception as e:
+            last_err = e
+            continue
 
-    # Responses API with JSON schema output
-    resp = client.responses.create(
-        model=YT_MODEL,
-        input=[
-            {"role": "system", "content": instruction},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        max_output_tokens=450,
-        response_format={
-            "type": "json_schema",
-            "name": "yt_shorts_metadata",
-            "schema": schema,
-            "strict": True,
-        },
-    )
-
-    text = (resp.output_text or "").strip()
-    return json.loads(text)
+    raise RuntimeError(f"Sora create/download failed for both sizes. last_err={last_err}")
 
 
 # =========================
-# Subtitle (ASS)
+# Subtitle (ASS) bottom-center, safe area
 # =========================
 def build_ass_subtitles_bottom(lines: List[str], total_dur: float, ass_path: str):
-    cleaned = [str(x).strip() for x in (lines or []) if str(x).strip()]
+    cleaned = []
+    for x in (lines or []):
+        s = sanitize_caption(x)
+        if s:
+            cleaned.append(s)
+
     if not cleaned:
-        cleaned = ["WAIT FOR IT...", "😂", ""]
+        cleaned = ["wait for it...", "😂", ""]
 
     beats = cleaned[:3]
-    n = len(beats)
-    seg = max(total_dur / max(n, 1), 1.5)
+    beats = [wrap_caption(b, SUB_MAX_CHARS_PER_LINE) for b in beats if b is not None]
+
+    n = max(len(beats), 1)
+    seg = max(total_dur / n, 1.6)
 
     def fmt_time(t: float) -> str:
         h = int(t // 3600)
@@ -276,14 +258,14 @@ def build_ass_subtitles_bottom(lines: List[str], total_dur: float, ass_path: str
     header = f"""[Script Info]
 Title: MemeSub
 ScriptType: v4.00+
-PlayResX: {VIDEO_W}
-PlayResY: {VIDEO_H}
+PlayResX: {OUT_W}
+PlayResY: {OUT_H}
 WrapStyle: 2
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,{SUB_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,8,2,2,60,60,{SUB_MARGIN_V},1
+Style: Default,Arial Black,{SUB_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,8,2,2,80,80,{SUB_MARGIN_V},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -294,7 +276,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start = t0
         end = min(total_dur, start + seg)
         t0 = end
-        txt = txt.replace("\n", r"\N")
+        txt = (txt or "").replace("\n", r"\N")
         events.append(f"Dialogue: 0,{fmt_time(start)},{fmt_time(end)},Default,,0,0,0,,{txt}")
 
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -303,32 +285,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # =========================
-# Video render (Ken Burns on AI image)
+# FFmpeg compose:
+# - input raw video (maybe landscape)
+# - scale/crop to 9:16 1080x1920
+# - burn subtitles (ASS)
+# - replace audio with TTS
 # =========================
-def make_kenburns_video_with_subs(image_path: str, audio_path: str, ass_path: str, out_mp4: str, dur: float):
+def compose_final_video(raw_video: str, tts_mp3: str, ass_path: str, out_mp4: str, dur: float):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
 
-    frames = int(max(dur * FPS, 1))
-    zoom_expr = "min(zoom+0.0012,1.18)"  # gentle zoom
-
     vf = (
-        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_W}:{VIDEO_H},"
-        f"zoompan=z='{zoom_expr}':d={frames}:s={VIDEO_W}x{VIDEO_H}:fps={FPS},"
+        f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+        f"crop={OUT_W}:{OUT_H},"
+        f"fps={FPS},"
         f"subtitles={ass_path}"
     )
 
     cmd = [
         "ffmpeg", "-y",
-        "-loop", "1",
-        "-i", image_path,
-        "-i", audio_path,
+        "-i", raw_video,
+        "-i", tts_mp3,
         "-t", f"{dur:.2f}",
         "-vf", vf,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-shortest",
-        "-r", str(FPS),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
@@ -339,31 +320,37 @@ def make_kenburns_video_with_subs(image_path: str, audio_path: str, ass_path: st
 
 
 # =========================
-# Prompt builder (AI meme image)
+# Prompt builder: meme video prompt (no copyrighted chars)
 # =========================
-def build_meme_image_prompt(variant: Dict[str, Any], region: str) -> str:
-    vtitle = str(variant.get("variant_title", "")).strip()
-    voiceover = str(variant.get("voiceover", "")).strip()
-    ons = variant.get("on_screen_text", []) or []
-    ons = [str(x).strip() for x in ons if str(x).strip()][:3]
+def build_meme_video_prompt(variant: Dict[str, Any], region: str) -> str:
+    vtitle = (variant.get("variant_title") or "").strip()
+    voiceover = (variant.get("voiceover") or "").strip()
+    ons = variant.get("on_screen_text") or []
+    ons = [sanitize_caption(x) for x in ons]
+    ons = [x for x in ons if x][:3]
 
-    prompt = f"""
-Create an ORIGINAL meme-style vertical scene (9:16) that fits a short funny voiceover.
+    # Prefer the existing analysis-produced video_prompt if it looks final
+    vp = (variant.get("video_prompt") or "").strip()
+    if vp:
+        # just add hard constraints for safety + vertical
+        return (
+            vp
+            + "\n\nConstraints: vertical 9:16, meme style, no logos, no real people, no copyrighted characters, "
+              "leave empty space near bottom for subtitles, high contrast, dynamic motion."
+        )
 
-Context:
-- Variant theme: {vtitle or "meme reaction"}
-- Voiceover (context only): {voiceover[:240]}
-- Caption beats: {", ".join(ons) if ons else "none"}
-- Region vibe: {region}
-
-Visual requirements:
-- One clear subject, exaggerated facial expression, comedic reaction
-- Simple background, high contrast, sharp focus
-- No logos, no brand names, no copyrighted characters
-- Leave empty space near the bottom for subtitles
-- Style: photorealistic or high-quality 3D render, meme-friendly
+    # Fallback prompt
+    hook = ons[0] if ons else (vtitle or "funny meme moment")
+    return f"""
+Vertical 9:16 meme-style short video.
+Scene: an original comedic situation, exaggerated reaction, dynamic motion.
+Tone: internet meme, funny, punchy.
+On-screen vibe: "{hook}"
+No logos, no brands, no copyrighted characters, no real people.
+Leave clean space near the bottom for subtitles.
+Lighting: high contrast, sharp, modern.
+Camera: quick push-in + slight handheld shake for punch.
 """.strip()
-    return prompt
 
 
 # =========================
@@ -389,11 +376,10 @@ def main():
     required = [
         "ai_status", "ai_variants_json", "video_id", "title", "region",
         "gen_status", "gen_video_file", "gen_note",
-        "yt_title", "yt_description", "yt_hashtags", "yt_tags",
     ]
     missing = [c for c in required if c not in idx]
     if missing:
-        raise RuntimeError(f"Missing columns in header row: {missing}. Please add them to the sheet.")
+        raise RuntimeError(f"Missing columns in header row: {missing}")
 
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
@@ -417,11 +403,8 @@ def main():
     to_process = candidates[:MAX_PER_RUN_GEN]
     print(f"[INFO] Generate candidates={len(candidates)} will_process={len(to_process)} (MAX_PER_RUN_GEN={MAX_PER_RUN_GEN})", flush=True)
 
-    # We'll update these columns as one rectangular batch update to save Sheets quota
-    cols_to_update = [
-        idx["gen_status"], idx["gen_video_file"], idx["gen_note"],
-        idx["yt_title"], idx["yt_description"], idx["yt_hashtags"], idx["yt_tags"],
-    ]
+    # batch update columns
+    cols_to_update = [idx["gen_status"], idx["gen_video_file"], idx["gen_note"]]
     start_col = min(cols_to_update)
     end_col = max(cols_to_update)
     width = end_col - start_col + 1
@@ -440,62 +423,56 @@ def main():
         gen_status = "failed"
         gen_file = ""
         gen_note = ""
-        yt_title = ""
-        yt_description = ""
-        yt_hashtags = ""
-        yt_tags = ""
 
         if not variants:
             gen_note = "No variants in ai_variants_json"
             print(f"[WARN] row={rnum} no variants.", flush=True)
         else:
             v = variants[min(max(VARIANT_INDEX, 0), len(variants) - 1)]
-            voiceover = str(v.get("voiceover", "")).strip()
-            on_screen = v.get("on_screen_text", []) or []
+            voiceover = (v.get("voiceover") or "").strip()
+            on_screen = v.get("on_screen_text") or []
+            on_screen = [sanitize_caption(x) for x in on_screen]
+            on_screen = [x for x in on_screen if x]
 
             if not voiceover:
                 gen_note = "Variant missing voiceover"
                 print(f"[WARN] row={rnum} missing voiceover.", flush=True)
             else:
                 try:
-                    base = f"{video_id}_ai_meme_v{VARIANT_INDEX+1}".replace("/", "_")
-                    mp3_path = os.path.join(OUTPUT_DIR, f"{base}.mp3")
+                    base = f"{video_id}_sora_v{VARIANT_INDEX+1}".replace("/", "_")
+                    tts_path = os.path.join(OUTPUT_DIR, f"{base}.mp3")
                     ass_path = os.path.join(OUTPUT_DIR, f"{base}.ass")
-                    img_path = os.path.join(OUTPUT_DIR, f"{base}.{IMG_OUTPUT_FORMAT}")
+                    raw_path = os.path.join(OUTPUT_DIR, f"{base}_raw.mp4")
                     out_mp4 = os.path.join(OUTPUT_DIR, f"{base}.mp4")
 
                     # 1) TTS
-                    make_tts_mp3(client, voiceover, mp3_path)
+                    make_tts_mp3(client, voiceover, tts_path)
 
-                    # 2) Duration clamp
-                    dur = clamp_duration(audio_duration_sec(mp3_path))
+                    # 2) Duration (follow TTS, cap 20s)
+                    dur = clamp_duration(audio_duration_sec(tts_path))
+                    seconds = int(max(4, min(20, round(dur))))
 
-                    # 3) Subs
+                    # 3) ASS subtitles (safe, wrapped, no placeholders)
                     build_ass_subtitles_bottom(on_screen, dur, ass_path)
 
-                    # 4) AI Image
-                    img_prompt = build_meme_image_prompt(v, region)
-                    img_meta = generate_ai_image(client, img_prompt, img_path)
+                    # 4) Sora text-to-video (create -> poll -> download mp4) :contentReference[oaicite:2]{index=2}
+                    prompt = build_meme_video_prompt(v, region)
+                    used_size, vid = sora_create_and_download_mp4(
+                        client=client,
+                        prompt=prompt,
+                        seconds=seconds,
+                        size_primary=VIDEO_SIZE_PRIMARY,
+                        size_fallback=VIDEO_SIZE_FALLBACK,
+                        out_raw_mp4=raw_path,
+                    )
 
-                    # 5) Render
-                    make_kenburns_video_with_subs(img_path, mp3_path, ass_path, out_mp4, dur)
-
-                    # 6) YouTube metadata
-                    meta = generate_youtube_metadata(client, v, region)
-                    yt_title = (meta.get("title") or "").strip()
-                    yt_description = (meta.get("description") or "").strip()
-                    hashtags_list = meta.get("hashtags") or []
-                    tags_list = meta.get("tags") or []
-                    yt_hashtags = " ".join([str(x).strip() for x in hashtags_list if str(x).strip()])
-                    yt_tags = ", ".join([str(x).strip() for x in tags_list if str(x).strip()])
+                    # 5) Compose final: crop/scale to 9:16 + burn subs + replace audio
+                    compose_final_video(raw_path, tts_path, ass_path, out_mp4, dur)
 
                     gen_status = "done"
                     gen_file = out_mp4
-                    gen_note = f"ok; dur={dur:.2f}s; img={img_meta.get('model')}/{img_meta.get('size')}/{img_meta.get('quality')}; fmt={img_meta.get('format')}; region={region}"
-                    if img_meta.get("revised_prompt"):
-                        gen_note += "; revised_prompt=yes"
-
-                    print(f"[OK] row={rnum} video_id={video_id} gen=done yt_title_len={len(yt_title)}", flush=True)
+                    gen_note = f"ok; dur={dur:.2f}s; sora_model={VIDEO_MODEL}; size={used_size}; video_id={vid}; subs_safe=1; placeholders_removed=1"
+                    print(f"[OK] row={rnum} video_id={video_id} gen=done dur={dur:.2f}s size={used_size}", flush=True)
 
                 except Exception as e:
                     gen_status = "failed"
@@ -512,18 +489,13 @@ def main():
         setcol(idx["gen_video_file"], gen_file)
         setcol(idx["gen_note"], gen_note)
 
-        setcol(idx["yt_title"], yt_title)
-        setcol(idx["yt_description"], yt_description)
-        setcol(idx["yt_hashtags"], yt_hashtags)
-        setcol(idx["yt_tags"], yt_tags)
-
         rng = f"{a1_col(start_col)}{rnum}:{a1_col(end_col)}{rnum}"
         batch_payload.append({"range": rng, "values": [rowvals]})
 
         time.sleep(0.6)
 
     ws.batch_update(batch_payload, value_input_option="RAW")
-    print(f"[DONE] Updated {len(to_process)} rows gen+yt metadata.", flush=True)
+    print(f"[DONE] Updated {len(to_process)} rows gen_status.", flush=True)
 
 
 if __name__ == "__main__":
