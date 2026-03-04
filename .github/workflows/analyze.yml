@@ -1,4 +1,4 @@
-name: Analyze New Entries (V3)
+name: Analyze New Entries (V3 - Gemini)
 
 on:
   schedule:
@@ -21,7 +21,7 @@ jobs:
       - name: Run analyzer
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
         run: python analyze_pending.py
