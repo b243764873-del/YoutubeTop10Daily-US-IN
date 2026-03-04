@@ -135,102 +135,151 @@ def parse_retry_delay_seconds(err_text: str) -> int | None:
 
 
 def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
-    """
-    OpenAI structured breakdown. Must return JSON dict.
-    Keep output bounded to avoid slow/hanging.
-    """
     transcript_snippet = safe_truncate(transcript, 2500)
     comments_snippet = comments[:20]
 
-    system = f"""
-You are a short-form video strategist/editor.
-Analyze a trending YouTube Short (<=20s) and extract a REUSABLE FORMAT to create an ORIGINAL video.
-Do NOT copy exact wording, unique jokes, names/brands, or identifiable characters.
-Clone structure/pacing, not content.
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "category": {"type": "string"},
+            "ai_generatable": {"type": "boolean"},
+            "ai_generatable_reason": {"type": "string"},
+            "hook_patterns": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3},
+            "beat_sheet": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "start_sec": {"type": "number"},
+                        "end_sec": {"type": "number"},
+                        "purpose": {"type": "string"},
+                        "on_screen_text_template": {"type": "string"},
+                        "voiceover_template": {"type": "string"},
+                        "visual_template": {"type": "string"},
+                        "edit_notes": {"type": "string"},
+                    },
+                    "required": [
+                        "start_sec", "end_sec", "purpose",
+                        "on_screen_text_template", "voiceover_template",
+                        "visual_template", "edit_notes"
+                    ],
+                },
+            },
+            "subtitle_style": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_chars_per_line": {"type": "number"},
+                    "lines": {"type": "number"},
+                    "emphasis_rules": {"type": "array", "items": {"type": "string"}},
+                    "placement": {"type": "string"},
+                },
+                "required": ["max_chars_per_line", "lines", "emphasis_rules", "placement"],
+            },
+            "edit_style": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "avg_shot_len_sec": {"type": "number"},
+                    "transitions": {"type": "array", "items": {"type": "string"}},
+                    "zoom_shake_usage": {"type": "string"},
+                    "sfx_cues": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["avg_shot_len_sec", "transitions", "zoom_shake_usage", "sfx_cues"],
+            },
+            "music_style": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "bpm_range": {"type": "string"},
+                    "mood": {"type": "string"},
+                    "instruments": {"type": "array", "items": {"type": "string"}},
+                    "reference_keywords": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["bpm_range", "mood", "instruments", "reference_keywords"],
+            },
+            "reusable_variables": {"type": "array", "items": {"type": "string"}},
+            "risk_notes": {"type": "array", "items": {"type": "string"}},
+            "generation_prompts": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "voiceover_prompt": {"type": "string"},
+                    "video_prompt": {"type": "string"},
+                    "subtitle_prompt": {"type": "string"},
+                },
+                "required": ["voiceover_prompt", "video_prompt", "subtitle_prompt"],
+            },
+            "variants": {
+                "type": "array",
+                "minItems": VARIANT_COUNT,
+                "maxItems": VARIANT_COUNT,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "variant_title": {"type": "string"},
+                        "variables": {"type": "object"},
+                        "voiceover": {"type": "string"},
+                        "on_screen_text": {"type": "array", "items": {"type": "string"}},
+                        "video_prompt": {"type": "string"},
+                        "subtitle_prompt": {"type": "string"},
+                    },
+                    "required": [
+                        "variant_title", "variables", "voiceover",
+                        "on_screen_text", "video_prompt", "subtitle_prompt"
+                    ],
+                },
+            },
+        },
+        "required": [
+            "category", "ai_generatable", "ai_generatable_reason",
+            "hook_patterns", "beat_sheet",
+            "subtitle_style", "edit_style", "music_style",
+            "reusable_variables", "risk_notes",
+            "generation_prompts", "variants"
+        ],
+    }
 
-Return VALID JSON ONLY (no markdown).
-Optimize for <=20 seconds, vertical 9:16.
-
-Schema:
-{{
-  "category": "string",
-  "ai_generatable": true/false,
-  "ai_generatable_reason": "string",
-  "hook_patterns": ["3 templates with [VARIABLES]"],
-  "beat_sheet": [
-    {{
-      "start_sec": number,
-      "end_sec": number,
-      "purpose": "hook/setup/twist/payoff/loop",
-      "on_screen_text_template": "string with [VARIABLES]",
-      "voiceover_template": "string with [VARIABLES]",
-      "visual_template": "string",
-      "edit_notes": "string"
-    }}
-  ],
-  "subtitle_style": {{
-    "max_chars_per_line": number,
-    "lines": number,
-    "emphasis_rules": ["..."],
-    "placement": "top/middle/bottom"
-  }},
-  "edit_style": {{
-    "avg_shot_len_sec": number,
-    "transitions": ["..."],
-    "zoom_shake_usage": "string",
-    "sfx_cues": ["..."]
-  }},
-  "music_style": {{
-    "bpm_range": "string",
-    "mood": "string",
-    "instruments": ["..."],
-    "reference_keywords": ["..."]
-  }},
-  "reusable_variables": ["[TOPIC]", "..."],
-  "risk_notes": ["..."],
-  "generation_prompts": {{
-    "voiceover_prompt": "string",
-    "video_prompt": "string",
-    "subtitle_prompt": "string"
-  }},
-  "variants": [
-    {{
-      "variant_title": "string",
-      "variables": {{ "KEY": "VALUE" }},
-      "voiceover": "18-20s voiceover",
-      "on_screen_text": ["subtitle lines in order"],
-      "video_prompt": "string",
-      "subtitle_prompt": "string"
-    }}
-  ]
-}}
-
-Variants requirements:
-- Provide EXACTLY {VARIANT_COUNT} variants.
-- Keep each voiceover <= 20 seconds.
-- Avoid copying source wording; keep original.
-"""
+    system = (
+        "You are a short-form video strategist/editor. "
+        "Extract reusable format from a trending YouTube Short (<=20s). "
+        "Do NOT copy exact wording, unique jokes, names/brands, or identifiable characters. "
+        "Clone structure/pacing, not content."
+    )
 
     user = {
         "region": region,
         "title": title,
         "transcript": transcript_snippet if transcript_snippet else "(no transcript available)",
         "top_comments": comments_snippet,
-        "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16"},
+        "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16", "variant_count": VARIANT_COUNT},
     }
 
-    # Responses API
     resp = client.responses.create(
         model=OPENAI_MODEL,
         max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "shorts_breakdown",
+                "schema": schema,
+                "strict": True,
+            },
+        },
         input=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
     )
+
+    # ✅ This will now be valid JSON (structured)
     raw = (resp.output_text or "").strip()
     return json.loads(raw)
-
 
 def openai_with_retry(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
     """
