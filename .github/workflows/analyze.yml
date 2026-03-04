@@ -1,8 +1,8 @@
-name: Analyze New Entries (Transcripts + AI)
+name: Analyze New Entries (V3)
 
 on:
   schedule:
-    - cron: "10 4 * * *"  # 台灣12:10，讓daily榜單先跑完
+    - cron: "10 4 * * *"  # Taiwan 12:10
   workflow_dispatch:
 
 jobs:
@@ -15,12 +15,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install packages
+      - name: Install deps
         run: pip install -r requirements.txt
 
       - name: Run analyzer
         env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python analyze_pending.py
