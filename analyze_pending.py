@@ -2,6 +2,8 @@ import os
 import json
 from typing import List, Tuple
 
+from openai import OpenAI
+
 import gspread
 from google.oauth2.service_account import Credentials
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -63,33 +65,75 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
     return "", {"error": "no_transcript"}
 
 
-def analyze_to_hook_and_templates(title: str, transcript: str):
+def analyze_to_hook_and_templates(client: OpenAI, title: str, transcript: str, region: str) -> Tuple[str, str, str]:
     """
-    Temporary non-AI analyzer (safe & free):
-    Later you can replace this with an AI call.
+    Use OpenAI to produce a structured 'clone-the-format-not-the-content' breakdown.
+    Returns: (hook_text, script_template, prompt_pack_json)
     """
-    t = (transcript or "").strip()
-    snippet = t[:220] + ("..." if len(t) > 220 else "")
+    transcript_snippet = (transcript or "").strip()
+    if len(transcript_snippet) > 4000:
+        transcript_snippet = transcript_snippet[:4000] + "..."
 
-    hook = f"Hook idea: {title.strip()}"
-    script_template = (
-        "0-2s: [Hook]\n"
-        "2-8s: [Context + 1 key point]\n"
-        "8-15s: [Twist / payoff]\n"
-        "15-20s: [CTA / loop]\n"
-        f"\nTranscript snippet: {snippet}"
-    )
-    prompt_pack = {
-        "voiceover_prompt": "Write an 18-20s voiceover using the structure above. Keep it original; do not copy phrases.",
-        "video_prompt": "Create a vertical 9:16 short video, fast cuts, big subtitles, 18-20 seconds.",
-        "subtitle_prompt": "Generate concise subtitles; emphasize keywords; keep lines short.",
+    instruction = """
+You are a short-form video strategist and editor.
+Goal: extract REUSABLE FORMAT (structure, pacing, hook patterns) from a trending YouTube Short (<=20s),
+so we can generate an ORIGINAL video with a similar format.
+
+Hard rules:
+- Do NOT copy unique jokes, exact phrasing, names, brands, or identifiable characters.
+- Output MUST be valid JSON only (no markdown).
+- Keep everything optimized for <=20 seconds and 9:16.
+
+Return JSON with keys:
+- category: short label
+- hook_patterns: array of 3 reusable hook templates with [VARIABLES]
+- beat_sheet: array of beats with {start_sec, end_sec, purpose, on_screen_text_template, voiceover_template, visual_template, edit_notes}
+- subtitle_style: {max_chars_per_line, lines, emphasis_rules, placement}
+- edit_style: {avg_shot_len_sec, transitions, zoom_shake_usage, sfx_cues}
+- music_style: {bpm_range, mood, instruments, reference_keywords}
+- reusable_variables: array of variables to swap (e.g., [TOPIC], [NUMBER], [CONTRAST], [PAYOFF])
+- risk_notes: array of risks to avoid (copyright, repetition, sensitive)
+- generation_prompts:
+  - voiceover_prompt
+  - video_prompt
+  - subtitle_prompt
+"""
+
+    user_input = {
+        "region": region,
+        "title": title,
+        "transcript": transcript_snippet if transcript_snippet else "(no transcript available)",
+        "constraints": {
+            "max_duration_sec": 20,
+            "aspect_ratio": "9:16",
+            "language_hint": "English" if region == "US" else "English/Hindi mix ok",
+        },
     }
-    return hook, script_template, json.dumps(prompt_pack, ensure_ascii=False)
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": json.dumps(user_input, ensure_ascii=False)},
+        ],
+    )
+
+    raw = resp.output_text.strip()
+    data = json.loads(raw)
+
+    hook_text = " | ".join(data.get("hook_patterns", [])[:3])
+    script_template = json.dumps(data.get("beat_sheet", []), ensure_ascii=False)
+    prompt_pack_json = json.dumps(data, ensure_ascii=False)
+
+    return hook_text, script_template, prompt_pack_json
 
 
 def main():
     sheet_id = os.environ["GSHEET_ID"]
     sa_json = os.environ["GSHEET_SA_JSON"]
+
+    # OpenAI client (reads OPENAI_API_KEY from env)
+    client = OpenAI()
 
     gc = gsheet_client_from_sa_json(sa_json)
     sh = gc.open_by_key(sheet_id)
@@ -103,7 +147,6 @@ def main():
         if c not in idx:
             raise RuntimeError(f"Missing header column: {c}. Please ensure daily_rank headers are correct.")
 
-    # Load all values once
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
         print("[INFO] No data rows.")
@@ -122,21 +165,16 @@ def main():
 
     print(f"[INFO] Pending rows: {len(pending_rnums)}")
 
-    # We'll batch update these columns for each pending row:
-    # ai_status, ai_hook, ai_script_template, ai_prompt_pack_json
     c_status = idx["ai_status"]
     c_hook = idx["ai_hook"]
     c_script = idx["ai_script_template"]
     c_pack = idx["ai_prompt_pack_json"]
 
-    # Prepare values in row order for a single rectangular range update:
-    # From min_row..max_row and from min_col..max_col
     min_row = min(pending_rnums)
     max_row = max(pending_rnums)
     min_col = min(c_status, c_hook, c_script, c_pack)
     max_col = max(c_status, c_hook, c_script, c_pack)
 
-    # Build a map rnum -> (status, hook, script, pack)
     updates = {}
     for rnum in pending_rnums:
         row = all_rows[rnum - 1]
@@ -147,14 +185,16 @@ def main():
         prefer_langs = ("en", "hi") if region == "IN" else ("en",)
         transcript, meta = get_transcript_text(video_id, prefer_langs=prefer_langs)
 
-        hook, script_template, prompt_pack_json = analyze_to_hook_and_templates(title, transcript)
-
-        if meta.get("error") == "no_transcript":
-            new_status = "no_transcript"
-        elif meta.get("error"):
+        try:
+            hook, script_template, prompt_pack_json = analyze_to_hook_and_templates(
+                client=client, title=title, transcript=transcript, region=region
+            )
+            new_status = "done"  # ✅ OpenAI 成功就 done（即使沒 transcript）
+        except Exception as e:
+            hook = ""
+            script_template = ""
+            prompt_pack_json = json.dumps({"error": str(e)}, ensure_ascii=False)
             new_status = "failed"
-        else:
-            new_status = "done"
 
         updates[rnum] = {
             c_status: new_status,
@@ -162,9 +202,8 @@ def main():
             c_script: script_template,
             c_pack: prompt_pack_json,
         }
-        print(f"[OK] prepared row={rnum} video_id={video_id} status={new_status}")
+        print(f"[OK] prepared row={rnum} video_id={video_id} transcript={meta.get('error', 'ok')} ai_status={new_status}")
 
-    # Create a 2D array for the whole rectangle [min_row..max_row] x [min_col..max_col]
     values = []
     for rnum in range(min_row, max_row + 1):
         row_vals = []
@@ -172,12 +211,11 @@ def main():
             if rnum in updates and c in updates[rnum]:
                 row_vals.append(updates[rnum][c])
             else:
-                row_vals.append("")  # leave blank for non-pending rows inside the rectangle
+                row_vals.append("")
         values.append(row_vals)
 
     a1_range = f"{a1_col(min_col)}{min_row}:{a1_col(max_col)}{max_row}"
     ws.update(a1_range, values, value_input_option="RAW")
-
     print(f"[DONE] Batch updated range {a1_range} for {len(pending_rnums)} pending rows.")
 
 
