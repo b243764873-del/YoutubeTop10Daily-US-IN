@@ -19,6 +19,9 @@ jobs:
 
       - name: Install deps
         run: pip install -r requirements.txt
+      - name: Show versions
+        run: |
+          python -c "import openai; print('openai version:', openai.__version__)"
 
       - name: Run analyzer
         env:
