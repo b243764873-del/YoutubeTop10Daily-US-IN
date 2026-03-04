@@ -13,18 +13,16 @@ from openai import OpenAI
 
 
 # =========================
-# Config
+# Config (via env)
 # =========================
 SHEET_NAME = os.getenv("SHEET_NAME", "daily_rank")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# Safety knobs (avoid "stuck for 10 minutes with no output")
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "5"))          # process at most N pending rows per workflow run
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1200"))
-OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "75"))  # hard-ish timeout: we implement via retries + backoff
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "5"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
 SLEEP_BETWEEN_ROWS_SEC = float(os.getenv("SLEEP_BETWEEN_ROWS_SEC", "0.8"))
 
-# Generate fewer variants to keep fast/stable. Change to 10 later.
+# Keep small for stability, then increase later
 VARIANT_COUNT = int(os.getenv("VARIANT_COUNT", "3"))
 
 
@@ -61,15 +59,28 @@ def safe_truncate(text: str, max_chars: int) -> str:
     return t[:max_chars] + "..."
 
 
+def parse_retry_delay_seconds(err_text: str) -> int | None:
+    """
+    Parses 'Please retry in XXs' if present.
+    """
+    t = err_text or ""
+    import re
+    m = re.search(r"retry in\s+(\d+)(?:\.\d+)?s", t, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
 def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, dict]:
     """
-    Try to get transcript for a video.
     Returns (text, meta). meta may contain error.
     """
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        # preferred languages first
         for lang in prefer_langs:
             try:
                 t = transcripts.find_transcript([lang])
@@ -79,7 +90,6 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
             except Exception:
                 pass
 
-        # fallback: first available
         for t in transcripts:
             segs = t.fetch()
             text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
@@ -95,7 +105,7 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
 
 def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str]:
     """
-    Grabs top comments. This can be slow/blocked; we catch and return [] quickly.
+    Fetches top comments; returns [] on any error to avoid blocking.
     """
     try:
         res = youtube.commentThreads().list(
@@ -105,6 +115,7 @@ def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str
             order="relevance",
             textFormat="plainText",
         ).execute()
+
         out = []
         for it in res.get("items", []):
             sn = it["snippet"]["topLevelComment"]["snippet"]
@@ -112,40 +123,30 @@ def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str
             if text:
                 out.append(text)
         return out[:max_comments]
+
     except HttpError:
         return []
     except Exception:
         return []
 
 
-def parse_retry_delay_seconds(err_text: str) -> int | None:
+def build_json_schema(variant_count: int) -> Dict[str, Any]:
     """
-    If error contains 'Please retry in XXs' return that.
+    Strict JSON schema: forces valid JSON output and reduces parse failures.
     """
-    t = (err_text or "")
-    # Example: "Please retry in 53.1947s."
-    import re
-    m = re.search(r"retry in\s+(\d+)(?:\.\d+)?s", t, flags=re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
-    transcript_snippet = safe_truncate(transcript, 2500)
-    comments_snippet = comments[:20]
-
-    schema = {
+    return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "category": {"type": "string"},
             "ai_generatable": {"type": "boolean"},
             "ai_generatable_reason": {"type": "string"},
-            "hook_patterns": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3},
+            "hook_patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 3
+            },
             "beat_sheet": {
                 "type": "array",
                 "minItems": 4,
@@ -216,8 +217,8 @@ def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List
             },
             "variants": {
                 "type": "array",
-                "minItems": VARIANT_COUNT,
-                "maxItems": VARIANT_COUNT,
+                "minItems": variant_count,
+                "maxItems": variant_count,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -245,6 +246,20 @@ def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List
         ],
     }
 
+
+def openai_breakdown_jsonschema(
+    client: OpenAI,
+    title: str,
+    transcript: str,
+    comments: List[str],
+    region: str,
+    variant_count: int,
+) -> Dict[str, Any]:
+    """
+    Uses response_format json_schema to force valid JSON.
+    """
+    schema = build_json_schema(variant_count)
+
     system = (
         "You are a short-form video strategist/editor. "
         "Extract reusable format from a trending YouTube Short (<=20s). "
@@ -255,9 +270,14 @@ def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List
     user = {
         "region": region,
         "title": title,
-        "transcript": transcript_snippet if transcript_snippet else "(no transcript available)",
-        "top_comments": comments_snippet,
-        "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16", "variant_count": VARIANT_COUNT},
+        "transcript": safe_truncate(transcript, 2500) if transcript else "(no transcript available)",
+        "top_comments": comments[:20],
+        "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16", "variant_count": variant_count},
+        "output_rules": {
+            "must_be_original": True,
+            "no_verbatim_copy": True,
+            "max_duration_sec": 20
+        }
     }
 
     resp = client.responses.create(
@@ -277,24 +297,28 @@ def openai_breakdown(client: OpenAI, title: str, transcript: str, comments: List
         ],
     )
 
-    # ✅ This will now be valid JSON (structured)
     raw = (resp.output_text or "").strip()
+    # With json_schema strict, this should be valid JSON.
     return json.loads(raw)
 
+
 def openai_with_retry(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
-    """
-    Retry wrapper to prevent random transient issues from killing the run.
-    """
     attempts = 3
     base_sleep = 6
-
     last_err = None
+
     for i in range(1, attempts + 1):
         try:
-            return openai_breakdown(client, title, transcript, comments, region)
+            return openai_breakdown_jsonschema(
+                client=client,
+                title=title,
+                transcript=transcript,
+                comments=comments,
+                region=region,
+                variant_count=VARIANT_COUNT,
+            )
         except Exception as e:
             last_err = str(e)
-            # If provider tells you a retry delay, respect it
             delay = parse_retry_delay_seconds(last_err)
             if delay is None:
                 delay = base_sleep * i
@@ -308,12 +332,10 @@ def openai_with_retry(client: OpenAI, title: str, transcript: str, comments: Lis
 # Main
 # =========================
 def main():
-    # Required env
     sheet_id = os.environ["GSHEET_ID"]
     sa_json = os.environ["GSHEET_SA_JSON"]
     yt_key = os.environ["YOUTUBE_API_KEY"]
 
-    # Setup clients
     youtube = yt_client(yt_key)
     client = OpenAI()  # reads OPENAI_API_KEY from env
 
@@ -330,7 +352,7 @@ def main():
     ]
     for c in required:
         if c not in idx:
-            raise RuntimeError(f"Missing header column: {c}. Please ensure main.py V3 headers are correct.")
+            raise RuntimeError(f"Missing header column: {c}. Please ensure daily_rank headers are correct.")
 
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
@@ -348,10 +370,12 @@ def main():
         print("[INFO] No pending rows.")
         return
 
-    # Limit per run
     total_pending = len(pending_rnums)
     pending_rnums = pending_rnums[:MAX_PER_RUN]
-    print(f"[INFO] Pending rows total={total_pending}, will process now={len(pending_rnums)} (MAX_PER_RUN={MAX_PER_RUN})", flush=True)
+    print(
+        f"[INFO] Pending rows total={total_pending}, will process now={len(pending_rnums)} (MAX_PER_RUN={MAX_PER_RUN})",
+        flush=True
+    )
 
     # Column indices
     c_status = idx["ai_status"]
@@ -384,7 +408,6 @@ def main():
         comments = get_top_comments(youtube, video_id, max_comments=20)
 
         try:
-            # OpenAI breakdown with retry
             data = openai_with_retry(client, title, transcript, comments, region)
 
             hook_text = " | ".join((data.get("hook_patterns") or [])[:3])
@@ -429,10 +452,8 @@ def main():
         rng = f"{a1_col(start_col)}{rnum}:{a1_col(end_col)}{rnum}"
         batch_payload.append({"range": rng, "values": [values]})
 
-        # throttle
         time.sleep(SLEEP_BETWEEN_ROWS_SEC)
 
-    # Batch update (one call)
     ws.batch_update(batch_payload, value_input_option="RAW")
     print(f"[DONE] Updated {len(pending_rnums)} rows. (Left pending={max(total_pending - len(pending_rnums), 0)})", flush=True)
 
