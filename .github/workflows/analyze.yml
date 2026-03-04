@@ -42,4 +42,6 @@ jobs:
           OPENAI_MAX_OUTPUT_TOKENS: 1800
           OPENAI_TIMEOUT_SEC: 75
           SLEEP_BETWEEN_ROWS_SEC: 0.8
+          AI_FILTER_ENABLED: 1
+          AI_MIN_SCORE: 3
         run: python analyze_pending.py
