@@ -37,7 +37,7 @@ jobs:
           # Tuning knobs (optional)
           SHEET_NAME: daily_rank
           MAX_PER_RUN: 5
-          VARIANT_COUNT: 3
+          VARIANT_COUNT: 10
           OPENAI_MODEL: gpt-4.1-mini
           OPENAI_MAX_OUTPUT_TOKENS: 1800
           OPENAI_TIMEOUT_SEC: 75
