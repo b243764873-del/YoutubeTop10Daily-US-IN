@@ -1,14 +1,13 @@
-name: Daily YouTube Shorts Top10 (US+IN)
+name: Daily YouTube Shorts Radar (US+IN)
 
 on:
   schedule:
-    - cron: "0 4 * * *"   # 台灣時間12:00
+    - cron: "0 4 * * *"   # Taiwan 12:00
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -16,10 +15,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install packages
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run daily radar
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
