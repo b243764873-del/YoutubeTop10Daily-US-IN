@@ -44,4 +44,9 @@ jobs:
           SLEEP_BETWEEN_ROWS_SEC: 0.8
           AI_FILTER_ENABLED: 1
           AI_MIN_SCORE: 3
+          AI_CLASSIFY_ENABLED: 1
+          AI_CLASSIFY_MODEL: gpt-4.1-mini
+          AI_CLASSIFY_MAX_TOKENS: 220
+          AI_CLASSIFY_MIN_CONFIDENCE: 60
+          AI_CLASSIFY_SLEEP_SEC: 0.3
         run: python analyze_pending.py
