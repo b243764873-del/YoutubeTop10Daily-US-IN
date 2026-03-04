@@ -33,7 +33,7 @@ jobs:
           MAX_PER_RUN: 5
           VARIANT_COUNT: 3
           OPENAI_MODEL: gpt-4.1-mini
-          OPENAI_MAX_OUTPUT_TOKENS: 1200
+          OPENAI_MAX_OUTPUT_TOKENS: 1800
           OPENAI_TIMEOUT_SEC: 75
           SLEEP_BETWEEN_ROWS_SEC: 0.8
         run: python analyze_pending.py
