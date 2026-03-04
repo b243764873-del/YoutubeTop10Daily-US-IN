@@ -132,7 +132,7 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 3,
-                "maxItems": 3
+                "maxItems": 3,
             },
             "beat_sheet": {
                 "type": "array",
@@ -151,9 +151,13 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                         "edit_notes": {"type": "string"},
                     },
                     "required": [
-                        "start_sec", "end_sec", "purpose",
-                        "on_screen_text_template", "voiceover_template",
-                        "visual_template", "edit_notes"
+                        "start_sec",
+                        "end_sec",
+                        "purpose",
+                        "on_screen_text_template",
+                        "voiceover_template",
+                        "visual_template",
+                        "edit_notes",
                     ],
                 },
             },
@@ -213,7 +217,7 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                         "variant_title": {"type": "string"},
                         "variables": {
                             "type": "object",
-                            "additionalProperties": False
+                            "additionalProperties": False,
                         },
                         "voiceover": {"type": "string"},
                         "on_screen_text": {"type": "array", "items": {"type": "string"}},
@@ -221,20 +225,31 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                         "subtitle_prompt": {"type": "string"},
                     },
                     "required": [
-                        "variant_title", "variables", "voiceover",
-                        "on_screen_text", "video_prompt", "subtitle_prompt"
+                        "variant_title",
+                        "variables",
+                        "voiceover",
+                        "on_screen_text",
+                        "video_prompt",
+                        "subtitle_prompt",
                     ],
                 },
             },
+        },  # ✅ close properties
         "required": [
-            "category", "ai_generatable", "ai_generatable_reason",
-            "hook_patterns", "beat_sheet",
-            "subtitle_style", "edit_style", "music_style",
-            "reusable_variables", "risk_notes",
-            "generation_prompts", "variants"
+            "category",
+            "ai_generatable",
+            "ai_generatable_reason",
+            "hook_patterns",
+            "beat_sheet",
+            "subtitle_style",
+            "edit_style",
+            "music_style",
+            "reusable_variables",
+            "risk_notes",
+            "generation_prompts",
+            "variants",
         ],
-    }
-
+    }  # ✅ close return dict
 
 def openai_breakdown_jsonschema_chat(
     client: OpenAI,
