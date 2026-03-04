@@ -7,7 +7,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 from youtube_transcript_api import YouTubeTranscriptApi
-import google.generativeai as genai
+from google import genai
 
 
 SHEET_NAME = "daily_rank"
@@ -64,9 +64,13 @@ variants (10 scripts)
 Each variant must be <=20 seconds.
 """
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents=prompt
+)
 
-    text = response.text.strip()
+text = response.text
+
 
     try:
         return json.loads(text)
@@ -80,9 +84,7 @@ def main():
     sa_json = os.environ["GSHEET_SA_JSON"]
     gemini_key = os.environ["GEMINI_API_KEY"]
 
-    genai.configure(api_key=gemini_key)
-
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = genai.Client(api_key=gemini_key)
 
     gc = gsheet_client_from_sa_json(sa_json)
     sh = gc.open_by_key(sheet_id)
