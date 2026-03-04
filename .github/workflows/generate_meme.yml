@@ -1,9 +1,9 @@
-name: Generate AI Meme Shorts (Image + TTS)
+name: Generate AI Meme Shorts (Image + TTS + YouTube Metadata)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 4 * * *"  # 台灣時間 12:10 (UTC 04:10)
+    - cron: "15 4 * * *"  # 台灣時間 12:15 (UTC 04:15)
 
 jobs:
   generate:
@@ -58,6 +58,11 @@ jobs:
           # Subs (bottom)
           SUB_MARGIN_V: 220
           SUB_FONT_SIZE: 84
+
+          # YouTube metadata
+          YT_MODEL: gpt-4.1-mini
+          YT_LANG: en
+          YT_MAX_TITLE_CHARS: 70
 
         run: |
           python generate_meme_video.py
