@@ -1,2 +1,15 @@
-# YoutubeTop10Daily-US-IN
-Track YouTube Shorts (&lt;=20s) Top10 daily for US &amp; India. Detect new entries and analyze with AI prompts.
+Daily YouTube Shorts Top10 tracker.
+
+Regions:
+- US
+- India
+
+Filters:
+- duration <= 20 seconds
+- published within 3 days
+
+Output:
+Google Sheet leaderboard
+
+Automation:
+GitHub Actions daily run at 12:00 Taiwan time.
