@@ -215,19 +215,13 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "variant_title": {"type": "string"},
-                        "variables": {
-                            "type": "object",
-                            "additionalProperties": False
-                        },
                         "voiceover": {"type": "string"},
                         "on_screen_text": {"type": "array", "items": {"type": "string"}},
                         "video_prompt": {"type": "string"},
                         "subtitle_prompt": {"type": "string"},
                     },
-                    # ✅ required 必須包含「且只包含」上面 properties 的 keys（順序不重要）
                     "required": [
                         "variant_title",
-                        "variables",
                         "voiceover",
                         "on_screen_text",
                         "video_prompt",
