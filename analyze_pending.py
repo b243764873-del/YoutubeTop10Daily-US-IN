@@ -203,29 +203,29 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                 "required": ["voiceover_prompt", "video_prompt", "subtitle_prompt"],
             },
             "variants": {
-    "type": "array",
-    "minItems": variant_count,
-    "maxItems": variant_count,
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "variant_title": {"type": "string"},
-            "variables": {
-                "type": "object",
-                "additionalProperties": False
+                "type": "array",
+                "minItems": variant_count,
+                "maxItems": variant_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "variant_title": {"type": "string"},
+                        "variables": {
+                            "type": "object",
+                            "additionalProperties": False
+                        },
+                        "voiceover": {"type": "string"},
+                        "on_screen_text": {"type": "array", "items": {"type": "string"}},
+                        "video_prompt": {"type": "string"},
+                        "subtitle_prompt": {"type": "string"},
+                    },
+                    "required": [
+                        "variant_title", "variables", "voiceover",
+                        "on_screen_text", "video_prompt", "subtitle_prompt"
+                    ],
+                },
             },
-            "voiceover": {"type": "string"},
-            "on_screen_text": {"type": "array", "items": {"type": "string"}},
-            "video_prompt": {"type": "string"},
-            "subtitle_prompt": {"type": "string"},
-        },
-        "required": [
-            "variant_title", "variables", "voiceover",
-            "on_screen_text", "video_prompt", "subtitle_prompt"
-        ],
-    },
-},
         "required": [
             "category", "ai_generatable", "ai_generatable_reason",
             "hook_patterns", "beat_sheet",
