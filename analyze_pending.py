@@ -71,29 +71,63 @@ def parse_retry_delay_seconds(err_text: str) -> int | None:
 
 
 def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, dict]:
+    """
+    Compatible across youtube-transcript-api versions:
+    - If list_transcripts exists => use it (supports language selection + better metadata)
+    - Else => fallback to get_transcript
+    """
     try:
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Newer versions support list_transcripts
+        if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+            transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
 
+            # preferred languages first
+            for lang in prefer_langs:
+                try:
+                    t = transcripts.find_transcript([lang])
+                    segs = t.fetch()
+                    text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
+                    return text, {"lang": t.language_code, "is_generated": getattr(t, "is_generated", None)}
+                except Exception:
+                    pass
+
+            # fallback: first available
+            for t in transcripts:
+                try:
+                    segs = t.fetch()
+                    text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
+                    if text:
+                        return text, {"lang": t.language_code, "is_generated": getattr(t, "is_generated", None)}
+                except Exception:
+                    continue
+
+            return "", {"error": "no_transcript"}
+
+        # Older versions: use get_transcript
         for lang in prefer_langs:
             try:
-                t = transcripts.find_transcript([lang])
-                segs = t.fetch()
+                segs = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
                 text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
-                return text, {"lang": t.language_code, "is_generated": getattr(t, "is_generated", None)}
+                if text:
+                    return text, {"lang": lang, "is_generated": None}
             except Exception:
                 pass
 
-        for t in transcripts:
-            segs = t.fetch()
+        # last fallback: no language preference
+        try:
+            segs = YouTubeTranscriptApi.get_transcript(video_id)
             text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
-            return text, {"lang": t.language_code, "is_generated": getattr(t, "is_generated", None)}
+            if text:
+                return text, {"lang": "unknown", "is_generated": None}
+        except Exception:
+            pass
+
+        return "", {"error": "no_transcript"}
 
     except (TranscriptsDisabled, NoTranscriptFound):
         return "", {"error": "no_transcript"}
     except Exception as e:
         return "", {"error": f"transcript_error: {e}"}
-
-    return "", {"error": "no_transcript"}
 
 
 def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str]:
