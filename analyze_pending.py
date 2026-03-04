@@ -1,12 +1,14 @@
 import os
 import json
-from typing import List, Tuple
-
-from openai import OpenAI
+from typing import List, Tuple, Dict, Any
 
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from openai import OpenAI
 
 
 SHEET_NAME = "daily_rank"
@@ -20,12 +22,10 @@ def gsheet_client_from_sa_json(sa_json_str: str):
 
 
 def find_header_indices(header_row: List[str]):
-    # header_row is list of header strings; return 1-based indices
-    return {name: (i + 1) for i, name in enumerate(header_row)}
+    return {name: (i + 1) for i, name in enumerate(header_row)}  # 1-based
 
 
 def a1_col(n: int) -> str:
-    """1->A, 2->B ... 27->AA"""
     s = ""
     while n:
         n, r = divmod(n - 1, 26)
@@ -33,15 +33,14 @@ def a1_col(n: int) -> str:
     return s
 
 
+def yt_client(api_key: str):
+    return build("youtube", "v3", developerKey=api_key)
+
+
 def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, dict]:
-    """
-    Try to get transcript for a video.
-    Returns (text, meta). meta may contain error.
-    """
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        # preferred languages first
         for lang in prefer_langs:
             try:
                 t = transcripts.find_transcript([lang])
@@ -51,7 +50,6 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
             except Exception:
                 pass
 
-        # fallback: first available
         for t in transcripts:
             segs = t.fetch()
             text = " ".join(s.get("text", "").replace("\n", " ").strip() for s in segs).strip()
@@ -65,75 +63,118 @@ def get_transcript_text(video_id: str, prefer_langs=("en", "hi")) -> Tuple[str, 
     return "", {"error": "no_transcript"}
 
 
-def analyze_to_hook_and_templates(client: OpenAI, title: str, transcript: str, region: str) -> Tuple[str, str, str]:
+def get_top_comments(youtube, video_id: str, max_comments: int = 20) -> List[str]:
+    try:
+        res = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            maxResults=min(max_comments, 100),
+            order="relevance",
+            textFormat="plainText",
+        ).execute()
+        out = []
+        for it in res.get("items", []):
+            sn = it["snippet"]["topLevelComment"]["snippet"]
+            text = (sn.get("textDisplay") or "").strip()
+            if text:
+                out.append(text)
+        return out[:max_comments]
+    except HttpError:
+        # comments disabled or restricted
+        return []
+    except Exception:
+        return []
+
+
+def openai_breakdown_v3(client: OpenAI, title: str, transcript: str, comments: List[str], region: str) -> Dict[str, Any]:
     """
-    Use OpenAI to produce a structured 'clone-the-format-not-the-content' breakdown.
-    Returns: (hook_text, script_template, prompt_pack_json)
+    Produce a reusable-format breakdown + AI-generatable decision + 10 variants.
+    Must return JSON dict.
     """
     transcript_snippet = (transcript or "").strip()
-    if len(transcript_snippet) > 4000:
-        transcript_snippet = transcript_snippet[:4000] + "..."
+    if len(transcript_snippet) > 3500:
+        transcript_snippet = transcript_snippet[:3500] + "..."
 
-    instruction = """
-You are a short-form video strategist and editor.
-Goal: extract REUSABLE FORMAT (structure, pacing, hook patterns) from a trending YouTube Short (<=20s),
-so we can generate an ORIGINAL video with a similar format.
+    comments_snippet = comments[:20]
 
-Hard rules:
-- Do NOT copy unique jokes, exact phrasing, names, brands, or identifiable characters.
-- Output MUST be valid JSON only (no markdown).
-- Keep everything optimized for <=20 seconds and 9:16.
+    system = """
+You are a short-form video strategist/editor.
+We analyze a trending YouTube Short (<=20s) and extract a REUSABLE FORMAT to create an ORIGINAL video.
+Do NOT copy exact phrasing, unique jokes, names/brands, or identifiable characters.
+We are cloning structure/pacing, not content.
 
-Return JSON with keys:
-- category: short label
-- hook_patterns: array of 3 reusable hook templates with [VARIABLES]
-- beat_sheet: array of beats with {start_sec, end_sec, purpose, on_screen_text_template, voiceover_template, visual_template, edit_notes}
-- subtitle_style: {max_chars_per_line, lines, emphasis_rules, placement}
-- edit_style: {avg_shot_len_sec, transitions, zoom_shake_usage, sfx_cues}
-- music_style: {bpm_range, mood, instruments, reference_keywords}
-- reusable_variables: array of variables to swap (e.g., [TOPIC], [NUMBER], [CONTRAST], [PAYOFF])
-- risk_notes: array of risks to avoid (copyright, repetition, sensitive)
-- generation_prompts:
-  - voiceover_prompt
-  - video_prompt
-  - subtitle_prompt
+Return VALID JSON ONLY (no markdown).
+All outputs must be optimized for <=20 seconds, vertical 9:16.
+
+Schema (JSON):
+{
+  "category": "string",
+  "ai_generatable": true/false,
+  "ai_generatable_reason": "string",
+  "hook_patterns": ["3 templates with [VARIABLES]"],
+  "beat_sheet": [
+    {
+      "start_sec": number,
+      "end_sec": number,
+      "purpose": "hook/setup/twist/payoff/loop",
+      "on_screen_text_template": "string with [VARIABLES]",
+      "voiceover_template": "string with [VARIABLES]",
+      "visual_template": "string",
+      "edit_notes": "string"
+    }
+  ],
+  "subtitle_style": { "max_chars_per_line": number, "lines": number, "emphasis_rules": ["..."], "placement": "top/middle/bottom" },
+  "edit_style": { "avg_shot_len_sec": number, "transitions": ["..."], "zoom_shake_usage": "string", "sfx_cues": ["..."] },
+  "music_style": { "bpm_range": "string", "mood": "string", "instruments": ["..."], "reference_keywords": ["..."] },
+  "reusable_variables": ["[TOPIC]", "..."],
+  "risk_notes": ["..."],
+  "generation_prompts": {
+    "voiceover_prompt": "string",
+    "video_prompt": "string",
+    "subtitle_prompt": "string"
+  },
+  "variants": [
+    {
+      "variant_title": "string",
+      "variables": { "KEY": "VALUE" },
+      "voiceover": "18-20s voiceover",
+      "on_screen_text": ["array of subtitle lines in order"],
+      "video_prompt": "string",
+      "subtitle_prompt": "string"
+    }
+  ]
+}
+
+Variants requirements:
+- Provide EXACTLY 10 variants.
+- Keep each voiceover <= 20s.
+- Avoid copying source wording; keep original.
 """
 
-    user_input = {
+    user = {
         "region": region,
         "title": title,
         "transcript": transcript_snippet if transcript_snippet else "(no transcript available)",
-        "constraints": {
-            "max_duration_sec": 20,
-            "aspect_ratio": "9:16",
-            "language_hint": "English" if region == "US" else "English/Hindi mix ok",
-        },
+        "top_comments": comments_snippet,
+        "constraints": {"max_duration_sec": 20, "aspect_ratio": "9:16"},
     }
 
     resp = client.responses.create(
         model="gpt-4.1-mini",
         input=[
-            {"role": "system", "content": instruction},
-            {"role": "user", "content": json.dumps(user_input, ensure_ascii=False)},
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
     )
 
     raw = resp.output_text.strip()
-    data = json.loads(raw)
-
-    hook_text = " | ".join(data.get("hook_patterns", [])[:3])
-    script_template = json.dumps(data.get("beat_sheet", []), ensure_ascii=False)
-    prompt_pack_json = json.dumps(data, ensure_ascii=False)
-
-    return hook_text, script_template, prompt_pack_json
+    return json.loads(raw)
 
 
 def main():
     sheet_id = os.environ["GSHEET_ID"]
     sa_json = os.environ["GSHEET_SA_JSON"]
-
-    # OpenAI client (reads OPENAI_API_KEY from env)
-    client = OpenAI()
+    yt_key = os.environ["YOUTUBE_API_KEY"]
 
     gc = gsheet_client_from_sa_json(sa_json)
     sh = gc.open_by_key(sheet_id)
@@ -142,10 +183,13 @@ def main():
     header = ws.row_values(1)
     idx = find_header_indices(header)
 
-    required_cols = ["ai_status", "ai_hook", "ai_script_template", "ai_prompt_pack_json", "video_id", "title", "region"]
-    for c in required_cols:
+    required = [
+        "ai_status", "ai_category", "ai_generatable", "ai_hook", "ai_script_template",
+        "ai_prompt_pack_json", "ai_variants_json", "video_id", "title", "region"
+    ]
+    for c in required:
         if c not in idx:
-            raise RuntimeError(f"Missing header column: {c}. Please ensure daily_rank headers are correct.")
+            raise RuntimeError(f"Missing header column: {c}. Make sure main.py V3 has updated headers.")
 
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
@@ -165,17 +209,25 @@ def main():
 
     print(f"[INFO] Pending rows: {len(pending_rnums)}")
 
+    # Batch-update rectangle cols
     c_status = idx["ai_status"]
+    c_cat = idx["ai_category"]
+    c_gen = idx["ai_generatable"]
     c_hook = idx["ai_hook"]
     c_script = idx["ai_script_template"]
     c_pack = idx["ai_prompt_pack_json"]
+    c_vars = idx["ai_variants_json"]
 
     min_row = min(pending_rnums)
     max_row = max(pending_rnums)
-    min_col = min(c_status, c_hook, c_script, c_pack)
-    max_col = max(c_status, c_hook, c_script, c_pack)
+    min_col = min(c_status, c_cat, c_gen, c_hook, c_script, c_pack, c_vars)
+    max_col = max(c_status, c_cat, c_gen, c_hook, c_script, c_pack, c_vars)
 
-    updates = {}
+    youtube = yt_client(yt_key)
+    client = OpenAI()
+
+    updates: Dict[int, Dict[int, str]] = {}
+
     for rnum in pending_rnums:
         row = all_rows[rnum - 1]
         video_id = row[idx["video_id"] - 1].strip()
@@ -184,26 +236,44 @@ def main():
 
         prefer_langs = ("en", "hi") if region == "IN" else ("en",)
         transcript, meta = get_transcript_text(video_id, prefer_langs=prefer_langs)
+        comments = get_top_comments(youtube, video_id, max_comments=20)
 
         try:
-            hook, script_template, prompt_pack_json = analyze_to_hook_and_templates(
-                client=client, title=title, transcript=transcript, region=region
-            )
-            new_status = "done"  # ✅ OpenAI 成功就 done（即使沒 transcript）
+            data = openai_breakdown_v3(client, title, transcript, comments, region)
+
+            hook_text = " | ".join((data.get("hook_patterns") or [])[:3])
+            script_template = json.dumps(data.get("beat_sheet") or [], ensure_ascii=False)
+            pack_json = json.dumps(data, ensure_ascii=False)
+            variants_json = json.dumps(data.get("variants") or [], ensure_ascii=False)
+
+            ai_category = str(data.get("category", "")).strip()
+            ai_generatable = "TRUE" if bool(data.get("ai_generatable", False)) else "FALSE"
+
+            updates[rnum] = {
+                c_status: "done",
+                c_cat: ai_category,
+                c_gen: ai_generatable,
+                c_hook: hook_text,
+                c_script: script_template,
+                c_pack: pack_json,
+                c_vars: variants_json,
+            }
+            print(f"[OK] row={rnum} video_id={video_id} transcript={meta.get('error','ok')} comments={len(comments)} done")
+
         except Exception as e:
-            hook = ""
-            script_template = ""
-            prompt_pack_json = json.dumps({"error": str(e)}, ensure_ascii=False)
-            new_status = "failed"
+            # Keep the error in prompt_pack_json for debugging
+            updates[rnum] = {
+                c_status: "failed",
+                c_cat: "",
+                c_gen: "",
+                c_hook: "",
+                c_script: "",
+                c_pack: json.dumps({"error": str(e)}, ensure_ascii=False),
+                c_vars: "",
+            }
+            print(f"[WARN] row={rnum} video_id={video_id} failed: {e}")
 
-        updates[rnum] = {
-            c_status: new_status,
-            c_hook: hook,
-            c_script: script_template,
-            c_pack: prompt_pack_json,
-        }
-        print(f"[OK] prepared row={rnum} video_id={video_id} transcript={meta.get('error', 'ok')} ai_status={new_status}")
-
+    # Build rectangle values
     values = []
     for rnum in range(min_row, max_row + 1):
         row_vals = []
@@ -216,7 +286,7 @@ def main():
 
     a1_range = f"{a1_col(min_col)}{min_row}:{a1_col(max_col)}{max_row}"
     ws.update(a1_range, values, value_input_option="RAW")
-    print(f"[DONE] Batch updated range {a1_range} for {len(pending_rnums)} pending rows.")
+    print(f"[DONE] Batch updated {a1_range} rows={len(pending_rnums)}")
 
 
 if __name__ == "__main__":
