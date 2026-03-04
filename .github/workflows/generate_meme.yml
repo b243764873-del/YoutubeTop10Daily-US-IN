@@ -1,0 +1,49 @@
+name: Generate Meme Shorts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 4 * * *"  # 台灣時間 12:05 (UTC+8 => UTC 04:05)
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install gspread google-auth google-api-python-client openai
+
+      - name: Run generator
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
+          SHEET_NAME: daily_rank
+          BROLL_DIR: assets/broll
+          OUTPUT_DIR: outputs
+          MAX_PER_RUN_GEN: 2
+          TTS_MODEL: gpt-4o-mini-tts
+          TTS_VOICE: alloy
+          MAX_DURATION_SEC: 20
+        run: |
+          python generate_meme_video.py
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: meme-shorts
+          path: outputs/*.mp4
