@@ -49,4 +49,8 @@ jobs:
           AI_CLASSIFY_MAX_TOKENS: 220
           AI_CLASSIFY_MIN_CONFIDENCE: 60
           AI_CLASSIFY_SLEEP_SEC: 0.3
+          AI_VISUAL_ENABLED: 1
+          AI_VISUAL_MODEL: gpt-4.1-mini
+          AI_VISUAL_MAX_TOKENS: 220
+          AI_VISUAL_MIN_CONFIDENCE: 55
         run: python analyze_pending.py
