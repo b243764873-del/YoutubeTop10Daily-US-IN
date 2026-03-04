@@ -1,4 +1,4 @@
-import os
+    import os
 import json
 import time
 from typing import List, Tuple, Dict, Any
@@ -214,6 +214,7 @@ def build_json_schema(variant_count: int) -> Dict[str, Any]:
                         "variables": {
                             "type": "object",
                             "additionalProperties": False
+                        },
                         "voiceover": {"type": "string"},
                         "on_screen_text": {"type": "array", "items": {"type": "string"}},
                         "video_prompt": {"type": "string"},
