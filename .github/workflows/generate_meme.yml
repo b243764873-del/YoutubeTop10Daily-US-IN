@@ -1,14 +1,19 @@
-name: Generate AI Meme Shorts (Sora video + TTS + Safe Subs)
+name: Generate Meme Shorts (Sora + TTS + Subs + YouTube Meta) - 3 Variants
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 4 * * *"  # 台灣時間 12:15 (UTC 04:15)
+    - cron: "20 4 * * *"  # 台灣時間 12:20 (UTC 04:20)
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant_index: [0, 1, 2]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "openai>=1.55.0" gspread google-auth
 
-      - name: Run generator (Sora)
+      - name: Run generator (matrix variant)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
@@ -37,7 +42,7 @@ jobs:
           SHEET_NAME: daily_rank
           OUTPUT_DIR: outputs
           MAX_PER_RUN_GEN: 2
-          GEN_VARIANT_INDEX: 0
+          GEN_VARIANT_INDEX: ${{ matrix.variant_index }}
           RETRY_FAILED: 0
 
           # TTS
@@ -51,16 +56,21 @@ jobs:
           POLL_INTERVAL_SEC: 10
           VIDEO_CREATE_TIMEOUT_SEC: 600
 
-          # Output (force 9:16)
+          # Output
           OUT_W: 1080
           OUT_H: 1920
           FPS: 30
           MAX_DURATION_SEC: 20
 
-          # Safe subtitles
+          # Subtitles safe area
           SUB_MARGIN_V: 280
           SUB_FONT_SIZE: 68
           SUB_MAX_CHARS_PER_LINE: 18
+
+          # YouTube metadata
+          YT_MODEL: gpt-4.1-mini
+          YT_LANG: en
+          YT_MAX_TITLE_CHARS: 70
 
         run: |
           python generate_meme_video.py
@@ -68,5 +78,5 @@ jobs:
       - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
-          name: sora-meme-shorts
+          name: sora-meme-shorts-variant-${{ matrix.variant_index }}
           path: outputs/*.mp4
