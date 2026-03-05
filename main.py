@@ -3,7 +3,7 @@ import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import gspread
 from google.oauth2.service_account import Credentials
