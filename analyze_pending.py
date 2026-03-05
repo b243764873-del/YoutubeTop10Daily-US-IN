@@ -2,7 +2,7 @@ import os
 import json
 import time
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -13,14 +13,18 @@ MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "5"))
 SLEEP_BETWEEN_ROWS_SEC = float(os.getenv("SLEEP_BETWEEN_ROWS_SEC", "0.8"))
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1800"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2200"))
 OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "75"))
 
 VARIANT_COUNT = int(os.getenv("VARIANT_COUNT", "3"))
 
-AI_TARGET_SECONDS_LOW = float(os.getenv("AI_TARGET_SECONDS_LOW", "7.0"))
-AI_TARGET_SECONDS_HIGH = float(os.getenv("AI_TARGET_SECONDS_HIGH", "11.0"))
-VOICEOVER_MAX_CHARS = int(os.getenv("VOICEOVER_MAX_CHARS", "220"))
+AI_TARGET_SECONDS_LOW = float(os.getenv("AI_TARGET_SECONDS_LOW", "8.0"))
+AI_TARGET_SECONDS_HIGH = float(os.getenv("AI_TARGET_SECONDS_HIGH", "12.0"))
+VOICEOVER_MAX_CHARS = int(os.getenv("VOICEOVER_MAX_CHARS", "260"))
+
+# Transcript handling
+TRANSCRIPT_COL = os.getenv("TRANSCRIPT_COL", "transcript")  # sheet column name
+TRANSCRIPT_MAX_CHARS = int(os.getenv("TRANSCRIPT_MAX_CHARS", "9000"))
 
 
 def gsheet_client_from_sa_json(sa_json_str: str):
@@ -46,6 +50,7 @@ def sanitize_no_placeholders(s: str) -> str:
     if not s:
         return ""
     s = str(s)
+    # remove placeholder-like brackets
     s = re.sub(r"\[[^\]]+\]", "", s)
     s = re.sub(r"\{[^}]+\}", "", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -53,6 +58,12 @@ def sanitize_no_placeholders(s: str) -> str:
 
 
 def build_schema(variant_count: int) -> Dict[str, Any]:
+    """
+    Keep backward compatibility:
+    - We still output: hook_patterns, beat_sheet, generation_prompts, variants[*].{variant_title, voiceover, on_screen_text, video_prompt, subtitle_prompt}
+    Add fidelity fields:
+    - core_claims, evidence, must_keep, meaning_guardrails
+    """
     return {
         "type": "object",
         "additionalProperties": False,
@@ -60,12 +71,48 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
             "category": {"type": "string"},
             "ai_generatable": {"type": "boolean"},
             "ai_generatable_reason": {"type": "string"},
+
+            "core_claims": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 7,
+                "items": {"type": "string"},
+            },
+            "evidence": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "claim_index": {"type": "number"},
+                        "quote": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["claim_index", "quote", "note"],
+                },
+            },
+            "must_keep": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 10,
+                "items": {"type": "string"},
+            },
+            "meaning_guardrails": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 10,
+                "items": {"type": "string"},
+            },
+
             "hook_patterns": {
                 "type": "array",
                 "minItems": 3,
                 "maxItems": 3,
                 "items": {"type": "string"},
             },
+
             "beat_sheet": {
                 "type": "array",
                 "minItems": 4,
@@ -89,6 +136,7 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
                     ],
                 },
             },
+
             "subtitle_style": {
                 "type": "object",
                 "additionalProperties": False,
@@ -122,8 +170,10 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
                 },
                 "required": ["bpm_range", "mood", "instruments", "reference_keywords"],
             },
+
             "reusable_variables": {"type": "array", "items": {"type": "string"}},
             "risk_notes": {"type": "array", "items": {"type": "string"}},
+
             "generation_prompts": {
                 "type": "object",
                 "additionalProperties": False,
@@ -134,6 +184,7 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
                 },
                 "required": ["voiceover_prompt", "video_prompt", "subtitle_prompt"],
             },
+
             "variants": {
                 "type": "array",
                 "minItems": variant_count,
@@ -159,6 +210,7 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
         },
         "required": [
             "category", "ai_generatable", "ai_generatable_reason",
+            "core_claims", "evidence", "must_keep", "meaning_guardrails",
             "hook_patterns", "beat_sheet",
             "subtitle_style", "edit_style", "music_style",
             "reusable_variables", "risk_notes",
@@ -167,13 +219,18 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
     }
 
 
-def responses_create_structured(client: OpenAI, *, model: str, input_messages: List[Dict[str, str]], schema: Dict[str, Any]):
+def responses_create_structured(
+    client: OpenAI,
+    *,
+    model: str,
+    input_messages: List[Dict[str, str]],
+    schema: Dict[str, Any],
+):
     """
     Compatibility layer:
     - Some SDKs accept response_format=...
     - Some SDKs require text={"format": ...} in Responses API
     """
-    # 1) Try response_format first
     try:
         return client.responses.create(
             model=model,
@@ -188,7 +245,6 @@ def responses_create_structured(client: OpenAI, *, model: str, input_messages: L
             timeout=OPENAI_TIMEOUT_SEC,
         )
     except TypeError:
-        # 2) Fallback to text.format (Responses API new shape)
         return client.responses.create(
             model=model,
             input=input_messages,
@@ -205,28 +261,37 @@ def responses_create_structured(client: OpenAI, *, model: str, input_messages: L
         )
 
 
-def analyze_with_openai(client: OpenAI, title: str, region: str) -> Dict[str, Any]:
+def analyze_with_openai(client: OpenAI, title: str, region: str, transcript: str) -> Dict[str, Any]:
     schema = build_schema(VARIANT_COUNT)
 
     instruction = f"""
-You are a Shorts meme strategist.
+You are a YouTube Shorts meme strategist.
 
-Goal:
-- Create ORIGINAL, AI-generatable meme shorts plan (do NOT copy any unique jokes/phrasing from the source).
-- Output MUST be STRICT JSON matching the schema.
+You MUST base everything on the provided transcript.
+Your meme must preserve the original meaning and key event.
 
 Hard rules:
-- NO placeholders like [TOPIC], [NUMBER], {{VAR}}, etc. Every caption and voiceover must be final publishable text.
-- Voiceover must be FINAL script, 1–3 short sentences.
+- Do NOT invent facts that are not in the transcript.
+- If transcript is unclear, simplify; NEVER guess new details.
+- No brands, no real person names, no copyrighted characters.
+- No placeholders like [TOPIC] or {{VAR}}; output publishable text only.
+- Voiceover must be FINAL script (1–3 short sentences).
 - Target spoken length: {AI_TARGET_SECONDS_LOW:.0f}–{AI_TARGET_SECONDS_HIGH:.0f} seconds.
 - Voiceover max {VOICEOVER_MAX_CHARS} characters.
-- Video is vertical 9:16, fast meme pacing, dynamic actions.
-- Avoid brands, real person names, copyrighted characters.
+- Provide a clear ending beat (last 2 seconds pause/freeze moment).
+
+Output MUST be STRICT JSON matching the schema.
 """.strip()
+
+    # Keep transcript compact but meaningful
+    tx = (transcript or "").strip()
+    if len(tx) > TRANSCRIPT_MAX_CHARS:
+        tx = tx[:TRANSCRIPT_MAX_CHARS]
 
     user_payload = {
         "title": title,
         "region": region,
+        "transcript": tx,
         "constraints": {
             "aspect_ratio": "9:16",
             "max_duration_sec": 20,
@@ -246,7 +311,7 @@ Hard rules:
 
     data = json.loads(resp.output_text)
 
-    # safety sanitize
+    # Safety sanitize + enforce char limits
     for v in data.get("variants", []):
         v["voiceover"] = sanitize_no_placeholders(v.get("voiceover", ""))[:VOICEOVER_MAX_CHARS]
         v["variant_title"] = sanitize_no_placeholders(v.get("variant_title", ""))
@@ -255,7 +320,19 @@ Hard rules:
         v["on_screen_text"] = [sanitize_no_placeholders(x) for x in (v.get("on_screen_text") or [])]
         v["on_screen_text"] = [x for x in v["on_screen_text"] if x][:4]
 
+    data["hook_patterns"] = [sanitize_no_placeholders(x) for x in (data.get("hook_patterns") or [])][:3]
+    data["core_claims"] = [sanitize_no_placeholders(x) for x in (data.get("core_claims") or [])][:7]
+    data["must_keep"] = [sanitize_no_placeholders(x) for x in (data.get("must_keep") or [])][:10]
+    data["meaning_guardrails"] = [sanitize_no_placeholders(x) for x in (data.get("meaning_guardrails") or [])][:10]
+
     return data
+
+
+def _get_cell(row: List[str], idx: Dict[str, int], col: str) -> str:
+    if col not in idx:
+        return ""
+    i = idx[col] - 1
+    return (row[i] if len(row) > i else "").strip()
 
 
 def main():
@@ -281,6 +358,9 @@ def main():
         if c not in idx:
             raise RuntimeError(f"Missing header column: {c}")
 
+    # transcript column is optional (but strongly recommended)
+    has_transcript = TRANSCRIPT_COL in idx
+
     all_rows = ws.get_all_values()
     if len(all_rows) <= 1:
         print("[INFO] No rows.", flush=True)
@@ -289,7 +369,7 @@ def main():
     pending = []
     for rnum in range(2, len(all_rows) + 1):
         row = all_rows[rnum - 1]
-        st = (row[idx["ai_status"] - 1] if len(row) >= idx["ai_status"] else "").strip()
+        st = _get_cell(row, idx, "ai_status")
         if st == "pending":
             pending.append(rnum)
 
@@ -299,6 +379,8 @@ def main():
 
     to_process = pending[:MAX_PER_RUN]
     print(f"[INFO] Pending rows total={len(pending)}, will process now={len(to_process)} (MAX_PER_RUN={MAX_PER_RUN})", flush=True)
+    if not has_transcript:
+        print(f"[WARN] Sheet has no '{TRANSCRIPT_COL}' column. AI will rely on title only -> meaning may drift.", flush=True)
 
     cols = [idx["ai_status"], idx["ai_hook"], idx["ai_script_template"], idx["ai_prompt_pack_json"], idx["ai_variants_json"]]
     start_col = min(cols)
@@ -309,8 +391,9 @@ def main():
 
     for rnum in to_process:
         row = all_rows[rnum - 1]
-        title = (row[idx["title"] - 1] if len(row) >= idx["title"] else "").strip()
-        region = (row[idx["region"] - 1] if len(row) >= idx["region"] else "").strip()
+        title = _get_cell(row, idx, "title")
+        region = _get_cell(row, idx, "region")
+        transcript = _get_cell(row, idx, TRANSCRIPT_COL) if has_transcript else ""
 
         status = "failed"
         hook = ""
@@ -319,7 +402,7 @@ def main():
         variants_json = ""
 
         try:
-            out = analyze_with_openai(client, title=title, region=region)
+            out = analyze_with_openai(client, title=title, region=region, transcript=transcript)
             status = "done"
             hook = " | ".join((out.get("hook_patterns") or [])[:3])
             script_template = json.dumps(out.get("beat_sheet") or [], ensure_ascii=False)
