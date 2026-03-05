@@ -2,7 +2,7 @@ import os
 import json
 import time
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -53,7 +53,6 @@ def sanitize_no_placeholders(s: str) -> str:
 
 
 def build_schema(variant_count: int) -> Dict[str, Any]:
-    # Strict JSON schema: no additional properties
     return {
         "type": "object",
         "additionalProperties": False,
@@ -145,7 +144,12 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
                     "properties": {
                         "variant_title": {"type": "string"},
                         "voiceover": {"type": "string"},
-                        "on_screen_text": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4},
+                        "on_screen_text": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                            "maxItems": 4
+                        },
                         "video_prompt": {"type": "string"},
                         "subtitle_prompt": {"type": "string"},
                     },
@@ -163,7 +167,45 @@ def build_schema(variant_count: int) -> Dict[str, Any]:
     }
 
 
-def analyze_with_openai(client: OpenAI, title: str, region: str, comments: List[str]) -> Dict[str, Any]:
+def responses_create_structured(client: OpenAI, *, model: str, input_messages: List[Dict[str, str]], schema: Dict[str, Any]):
+    """
+    Compatibility layer:
+    - Some SDKs accept response_format=...
+    - Some SDKs require text={"format": ...} in Responses API
+    """
+    # 1) Try response_format first
+    try:
+        return client.responses.create(
+            model=model,
+            input=input_messages,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+            response_format={
+                "type": "json_schema",
+                "name": "shorts_breakdown",
+                "schema": schema,
+                "strict": True,
+            },
+            timeout=OPENAI_TIMEOUT_SEC,
+        )
+    except TypeError:
+        # 2) Fallback to text.format (Responses API new shape)
+        return client.responses.create(
+            model=model,
+            input=input_messages,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "shorts_breakdown",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            timeout=OPENAI_TIMEOUT_SEC,
+        )
+
+
+def analyze_with_openai(client: OpenAI, title: str, region: str) -> Dict[str, Any]:
     schema = build_schema(VARIANT_COUNT)
 
     instruction = f"""
@@ -180,18 +222,11 @@ Hard rules:
 - Voiceover max {VOICEOVER_MAX_CHARS} characters.
 - Video is vertical 9:16, fast meme pacing, dynamic actions.
 - Avoid brands, real person names, copyrighted characters.
-- Captions: 2–4 beats, short, punchy, easy to read.
-
-Also create video_prompt suited for text-to-video generation:
-- Include camera: quick push-in near punchline, slight handheld shake, high contrast lighting.
-- Ask for 2–3 distinct actions.
-- "No on-screen text" (we add subtitles later).
 """.strip()
 
     user_payload = {
         "title": title,
         "region": region,
-        "top_comments": comments[:20],
         "constraints": {
             "aspect_ratio": "9:16",
             "max_duration_sec": 20,
@@ -199,25 +234,19 @@ Also create video_prompt suited for text-to-video generation:
         },
     }
 
-    resp = client.responses.create(
+    resp = responses_create_structured(
+        client,
         model=OPENAI_MODEL,
-        input=[
+        input_messages=[
             {"role": "system", "content": instruction},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-        response_format={
-            "type": "json_schema",
-            "name": "shorts_breakdown",
-            "schema": schema,
-            "strict": True,
-        },
-        timeout=OPENAI_TIMEOUT_SEC,
+        schema=schema,
     )
 
     data = json.loads(resp.output_text)
 
-    # last safety: strip any placeholders if model slips
+    # safety sanitize
     for v in data.get("variants", []):
         v["voiceover"] = sanitize_no_placeholders(v.get("voiceover", ""))[:VOICEOVER_MAX_CHARS]
         v["variant_title"] = sanitize_no_placeholders(v.get("variant_title", ""))
@@ -271,20 +300,17 @@ def main():
     to_process = pending[:MAX_PER_RUN]
     print(f"[INFO] Pending rows total={len(pending)}, will process now={len(to_process)} (MAX_PER_RUN={MAX_PER_RUN})", flush=True)
 
-    # batch update columns
     cols = [idx["ai_status"], idx["ai_hook"], idx["ai_script_template"], idx["ai_prompt_pack_json"], idx["ai_variants_json"]]
     start_col = min(cols)
     end_col = max(cols)
     width = end_col - start_col + 1
 
     payload = []
+
     for rnum in to_process:
         row = all_rows[rnum - 1]
         title = (row[idx["title"] - 1] if len(row) >= idx["title"] else "").strip()
         region = (row[idx["region"] - 1] if len(row) >= idx["region"] else "").strip()
-
-        # We keep comments optional; if you already have comments column, plug it in here.
-        comments: List[str] = []
 
         status = "failed"
         hook = ""
@@ -293,7 +319,7 @@ def main():
         variants_json = ""
 
         try:
-            out = analyze_with_openai(client, title=title, region=region, comments=comments)
+            out = analyze_with_openai(client, title=title, region=region)
             status = "done"
             hook = " | ".join((out.get("hook_patterns") or [])[:3])
             script_template = json.dumps(out.get("beat_sheet") or [], ensure_ascii=False)
@@ -302,8 +328,7 @@ def main():
             print(f"[OK] row={rnum} status=done variants={len(out.get('variants') or [])}", flush=True)
         except Exception as e:
             status = "failed"
-            err_obj = {"error": str(e)}
-            pack_json = json.dumps(err_obj, ensure_ascii=False)
+            pack_json = json.dumps({"error": str(e)}, ensure_ascii=False)
             variants_json = json.dumps([], ensure_ascii=False)
             print(f"[WARN] row={rnum} status=failed err={e}", flush=True)
 
