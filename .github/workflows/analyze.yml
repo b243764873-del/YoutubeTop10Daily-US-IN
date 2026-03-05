@@ -20,8 +20,9 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade --no-cache-dir youtube-transcript-api
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
+          pip install --upgrade --no-cache-dir openai gspread google-auth youtube-transcript-api
+          python -c "import openai; print('openai version:', openai.__version__)"
       - name: Show versions
         run: |
           python -c "import openai; print('openai version:', openai.__version__)"
