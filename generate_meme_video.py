@@ -3,7 +3,7 @@ import json
 import time
 import re
 import subprocess
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,6 +23,10 @@ RETRY_FAILED = os.getenv("RETRY_FAILED", "0") == "1"
 # TTS
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+
+# Subtitle alignment (ASR on the generated TTS audio)
+SUB_ALIGN_MODE = os.getenv("SUB_ALIGN_MODE", "asr").lower().strip()  # "asr" or "simple"
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")  # fallback could be "whisper-1"
 
 # Sora / Videos API
 VIDEO_MODEL = os.getenv("VIDEO_MODEL", "sora-2")
@@ -140,6 +144,42 @@ def wrap_caption(text: str, max_chars: int = 18) -> str:
     return left + r"\N" + right
 
 
+def split_for_subtitles(text: str) -> List[str]:
+    """
+    Split voiceover into subtitle-friendly chunks.
+    """
+    t = sanitize_caption(text)
+    if not t:
+        return []
+    # prefer punctuation boundaries
+    parts = re.split(r"(?<=[\.\!\?\。！？])\s+", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    # if no punctuation, split by commas then by length
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=[,，;；:：])\s*", t)
+        parts = [p.strip() for p in parts if p.strip()]
+    # final safety: if still one long line, chunk by length
+    out = []
+    for p in parts:
+        if len(p) <= SUB_MAX_CHARS_PER_LINE:
+            out.append(p)
+        else:
+            # chunk by words
+            words = p.split(" ")
+            buf = ""
+            for w in words:
+                if not buf:
+                    buf = w
+                elif len(buf) + 1 + len(w) <= SUB_MAX_CHARS_PER_LINE:
+                    buf += " " + w
+                else:
+                    out.append(buf)
+                    buf = w
+            if buf:
+                out.append(buf)
+    return out[:10]  # keep it sane
+
+
 # =========================
 # OpenAI helpers
 # =========================
@@ -176,6 +216,39 @@ def make_tts_mp3(client: OpenAI, text: str, out_path: str):
         f.write(data)
 
 
+def transcribe_tts_for_timestamps(client: OpenAI, audio_path: str) -> Optional[Dict[str, Any]]:
+    """
+    ASR the generated TTS to get timestamps. This makes subtitles match audio.
+    Returns verbose_json-like dict or None on failure.
+    """
+    try:
+        with open(audio_path, "rb") as f:
+            # new SDK signature variants differ; handle best-effort
+            try:
+                resp = client.audio.transcriptions.create(
+                    model=TRANSCRIBE_MODEL,
+                    file=f,
+                    response_format="verbose_json",
+                )
+            except TypeError:
+                resp = client.audio.transcriptions.create(
+                    model=TRANSCRIBE_MODEL,
+                    file=f,
+                    format="verbose_json",
+                )
+        # resp may be dict-like or object with .to_dict()
+        if isinstance(resp, dict):
+            return resp
+        if hasattr(resp, "to_dict"):
+            return resp.to_dict()
+        # fallback: try json loads on string
+        if hasattr(resp, "text"):
+            return {"text": resp.text}
+        return None
+    except Exception:
+        return None
+
+
 def sora_create_and_download_mp4(
     client: OpenAI,
     prompt: str,
@@ -200,7 +273,9 @@ def sora_create_and_download_mp4(
 
             while status in ("queued", "in_progress"):
                 if time.time() - start_ts > VIDEO_CREATE_TIMEOUT_SEC:
-                    raise RuntimeError(f"Sora timeout > {VIDEO_CREATE_TIMEOUT_SEC}s (video_id={vid}, status={status}, progress={progress})")
+                    raise RuntimeError(
+                        f"Sora timeout > {VIDEO_CREATE_TIMEOUT_SEC}s (video_id={vid}, status={status}, progress={progress})"
+                    )
                 time.sleep(POLL_INTERVAL_SEC)
                 video = client.videos.retrieve(vid)
                 status = getattr(video, "status", None)
@@ -221,21 +296,64 @@ def sora_create_and_download_mp4(
     raise RuntimeError(f"Sora create/download failed for both sizes. last_err={last_err}")
 
 
-def build_ass_subtitles_bottom(lines: List[str], total_dur: float, ass_path: str):
-    cleaned = []
-    for x in (lines or []):
-        s = sanitize_caption(x)
-        if s:
-            cleaned.append(s)
+def build_ass_from_segments(
+    segments: List[Dict[str, Any]],
+    total_dur: float,
+    ass_path: str,
+):
+    """
+    segments: [{'start': 0.0, 'end': 1.2, 'text': '...'}, ...]
+    """
+    def fmt_time(t: float) -> str:
+        t = max(0.0, min(float(t), total_dur))
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = t % 60
+        return f"{h}:{m:02d}:{s:05.2f}"
 
-    if not cleaned:
-        cleaned = ["wait for it...", "😂", ""]
+    header = f"""[Script Info]
+Title: MemeSub
+ScriptType: v4.00+
+PlayResX: {OUT_W}
+PlayResY: {OUT_H}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
 
-    beats = cleaned[:3]
-    beats = [wrap_caption(b, SUB_MAX_CHARS_PER_LINE) for b in beats]
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial Black,{SUB_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,8,2,2,80,80,{SUB_MARGIN_V},1
 
-    n = max(len(beats), 1)
-    seg = max(total_dur / n, 1.6)
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    for seg in segments:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        txt = sanitize_caption(seg.get("text", ""))
+        if not txt:
+            continue
+        if end <= start:
+            end = min(total_dur, start + 1.6)
+        txt = wrap_caption(txt, SUB_MAX_CHARS_PER_LINE).replace("\n", r"\N")
+        events.append(f"Dialogue: 0,{fmt_time(start)},{fmt_time(end)},Default,,0,0,0,,{txt}")
+
+    if not events:
+        # fallback
+        events.append(f"Dialogue: 0,{fmt_time(0.0)},{fmt_time(min(total_dur, 2.5))},Default,,0,0,0,,wait for it...")
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write("\n".join(events))
+
+
+def build_ass_simple_from_text(text: str, total_dur: float, ass_path: str):
+    lines = split_for_subtitles(text)
+    if not lines:
+        lines = ["wait for it...", "😂"]
+
+    n = max(len(lines), 1)
+    seg = max(total_dur / n, 1.4)
 
     def fmt_time(t: float) -> str:
         h = int(t // 3600)
@@ -260,11 +378,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
     t0 = 0.0
-    for txt in beats:
+    for txt in lines:
         start = t0
         end = min(total_dur, start + seg)
         t0 = end
-        txt = (txt or "").replace("\n", r"\N")
+        txt = wrap_caption(txt, SUB_MAX_CHARS_PER_LINE).replace("\n", r"\N")
         events.append(f"Dialogue: 0,{fmt_time(start)},{fmt_time(end)},Default,,0,0,0,,{txt}")
 
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -300,39 +418,57 @@ def compose_final_video(raw_video: str, tts_mp3: str, ass_path: str, out_mp4: st
     run(cmd)
 
 
-def build_meme_video_prompt(variant: Dict[str, Any], region: str) -> str:
+def build_meme_video_prompt(variant: Dict[str, Any], region: str, seconds: int) -> str:
     """
-    B) 強化動態感：快節奏、推鏡、手持晃動、2-3個動作、對比光
-    並強制：不要片上文字（字幕我們後加）
+    Stronger ending control:
+    - Shot list structure
+    - Explicit final 2 seconds freeze / ending pose
+    - No abrupt cut at end
     """
-    vp = (variant.get("video_prompt") or "").strip()
-    if vp:
-        return vp + (
-            "\n\nExtra constraints:"
-            "\n- Vertical 9:16"
-            "\n- Fast meme pacing"
-            "\n- Quick push-in near punchline"
-            "\n- Slight handheld camera shake"
-            "\n- 2–3 distinct actions in the scene"
-            "\n- High contrast lighting, crisp subject"
-            "\n- NO on-screen text (subtitles will be added later)"
-            "\n- No logos, no brands, no copyrighted characters, no real people"
-            "\n- Leave clean space near bottom for subtitles"
-        )
+    voiceover = sanitize_caption(variant.get("voiceover", ""))[:260]
+    vtitle = sanitize_caption(variant.get("variant_title", ""))[:80]
 
-    voiceover = sanitize_caption(variant.get("voiceover", ""))[:240]
-    return f"""
-Vertical 9:16 meme-style short video.
-Style anchor: viral shorts meme, comedic reaction, dynamic motion, cinematic lighting.
-Scene: original comedic situation with exaggerated reaction.
-Pacing: fast, punchy.
-Camera: quick push-in near the punchline, slight handheld shake.
-Action: include 2–3 distinct actions.
-No logos, no brands, no copyrighted characters, no real people.
-NO on-screen text (subtitles added later). Leave bottom space clean.
-Context voiceover (for vibe only): {voiceover}
+    # Use provided variant video_prompt if exists, but still enforce structure
+    base_scene = sanitize_caption(variant.get("video_prompt", "")).strip()
+
+    prompt = f"""
+Create a SINGLE coherent meme-style short video.
+
+Format:
+- Vertical 9:16
+- Duration: {seconds} seconds
+- One continuous scene (avoid sudden location swaps)
+
+Story beats (must follow):
+1) 0-2s: Hook moment (immediate funny tension)
+2) 2-5s: Context reveal
+3) 5-{max(6, seconds-2)}s: Escalation / reaction with 2–3 distinct actions
+4) Last 2 seconds: CLEAR ENDING
+   - character holds a reaction pose (freeze/slow)
+   - camera stabilizes
+   - no abrupt cut to black
+   - hold the final frame so it feels complete
+
+Camera / edit:
+- Fast meme pacing
+- Quick push-in near punchline
+- Slight handheld shake (not too much)
+- Crisp subject, high contrast lighting
+- Leave bottom area visually clean for subtitles
+
+Hard constraints:
+- NO on-screen text
+- No logos, no brands
+- No copyrighted characters, no real people
+
 Region vibe: {region}
+Variant title (internal): {vtitle}
+Voiceover context (for timing only): {voiceover}
+
+Scene guidance (optional): {base_scene if base_scene else "Original comedic situation with exaggerated reaction; everyday setting; safe and non-branded."}
 """.strip()
+
+    return prompt
 
 
 def generate_youtube_metadata(client: OpenAI, variant: Dict[str, Any], region: str) -> Dict[str, Any]:
@@ -504,11 +640,33 @@ def main():
             # Ensure we don't render longer than the generated video
             dur = min(dur, float(seconds))
 
-            # 3) Subtitles safe + wrap
-            build_ass_subtitles_bottom(on_screen, dur, ass_path)
+            # 3) Build subtitles:
+            #    Prefer ASR alignment on TTS audio (best sync), fallback to simple split
+            segs_for_ass: Optional[List[Dict[str, Any]]] = None
+            if SUB_ALIGN_MODE == "asr":
+                tr = transcribe_tts_for_timestamps(client, tts_path)
+                if tr and isinstance(tr, dict):
+                    # verbose_json typically has "segments": [{start, end, text}, ...]
+                    segments = tr.get("segments") or []
+                    if isinstance(segments, list) and segments:
+                        segs_for_ass = []
+                        for s in segments:
+                            segs_for_ass.append({
+                                "start": float(s.get("start", 0.0)),
+                                "end": float(s.get("end", 0.0)),
+                                "text": sanitize_caption(s.get("text", "")),
+                            })
 
-            # 4) Sora text-to-video
-            prompt = build_meme_video_prompt(v, region)
+            if segs_for_ass:
+                build_ass_from_segments(segs_for_ass, dur, ass_path)
+                subs_mode = "asr"
+            else:
+                # fallback: use voiceover (NOT on_screen) so content matches audio
+                build_ass_simple_from_text(voiceover, dur, ass_path)
+                subs_mode = "simple"
+
+            # 4) Sora text-to-video with stronger ending control
+            prompt = build_meme_video_prompt(v, region, seconds)
             used_size, vid = sora_create_and_download_mp4(
                 client=client,
                 prompt=prompt,
@@ -532,9 +690,12 @@ def main():
 
             gen_status = "done"
             gen_file = out_mp4
-            gen_note = f"ok; dur={dur:.2f}s; sora={VIDEO_MODEL}; size={used_size}; video_id={vid}; variant={VARIANT_INDEX+1}; subs_safe=1; placeholders_removed=1"
+            gen_note = (
+                f"ok; dur={dur:.2f}s; sora={VIDEO_MODEL}; size={used_size}; video_id={vid}; "
+                f"variant={VARIANT_INDEX+1}; subs_mode={subs_mode}; ending_freeze=1"
+            )
 
-            print(f"[OK] row={rnum} video_id={video_id} status=done variant={VARIANT_INDEX+1} dur={dur:.2f}s", flush=True)
+            print(f"[OK] row={rnum} video_id={video_id} status=done variant={VARIANT_INDEX+1} dur={dur:.2f}s subs={subs_mode}", flush=True)
 
         except Exception as e:
             gen_status = "failed"
