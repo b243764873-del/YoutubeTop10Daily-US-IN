@@ -24,23 +24,28 @@ RETRY_FAILED = os.getenv("RETRY_FAILED", "0") == "1"
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 
-# Video generation (Sora / Videos API)
+# Sora / Videos API
 VIDEO_MODEL = os.getenv("VIDEO_MODEL", "sora-2")
-VIDEO_SIZE_PRIMARY = os.getenv("VIDEO_SIZE_PRIMARY", "720x1280")   # try vertical first
-VIDEO_SIZE_FALLBACK = os.getenv("VIDEO_SIZE_FALLBACK", "1280x720") # fallback to landscape then crop to vertical
+VIDEO_SIZE_PRIMARY = os.getenv("VIDEO_SIZE_PRIMARY", "720x1280")   # vertical first
+VIDEO_SIZE_FALLBACK = os.getenv("VIDEO_SIZE_FALLBACK", "1280x720") # fallback then crop
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "10"))
-VIDEO_CREATE_TIMEOUT_SEC = float(os.getenv("VIDEO_CREATE_TIMEOUT_SEC", "600"))  # max wait per video job
+VIDEO_CREATE_TIMEOUT_SEC = float(os.getenv("VIDEO_CREATE_TIMEOUT_SEC", "600"))
 
-# Output video
+# Output
 OUT_W = int(os.getenv("OUT_W", "1080"))
 OUT_H = int(os.getenv("OUT_H", "1920"))
 FPS = int(os.getenv("FPS", "30"))
 MAX_DURATION_SEC = float(os.getenv("MAX_DURATION_SEC", "20.0"))
 
 # Subtitles safe area
-SUB_MARGIN_V = int(os.getenv("SUB_MARGIN_V", "280"))  # increase margin to avoid out-of-frame
-SUB_FONT_SIZE = int(os.getenv("SUB_FONT_SIZE", "68")) # smaller than before
+SUB_MARGIN_V = int(os.getenv("SUB_MARGIN_V", "280"))
+SUB_FONT_SIZE = int(os.getenv("SUB_FONT_SIZE", "68"))
 SUB_MAX_CHARS_PER_LINE = int(os.getenv("SUB_MAX_CHARS_PER_LINE", "18"))
+
+# YouTube metadata
+YT_MODEL = os.getenv("YT_MODEL", "gpt-4.1-mini")
+YT_LANG = os.getenv("YT_LANG", "en")
+YT_MAX_TITLE_CHARS = int(os.getenv("YT_MAX_TITLE_CHARS", "70"))
 
 
 # =========================
@@ -56,12 +61,6 @@ def run(cmd: List[str]) -> str:
 def ensure_ffmpeg():
     run(["ffmpeg", "-version"])
     run(["ffprobe", "-version"])
-
-
-def clamp_duration(d: float) -> float:
-    if d <= 0:
-        return 8.0
-    return min(d, MAX_DURATION_SEC)
 
 
 def safe_load_json(s: str):
@@ -84,8 +83,14 @@ def audio_duration_sec(audio_path: str) -> float:
         return 0.0
 
 
+def clamp_duration(d: float) -> float:
+    if d <= 0:
+        return 8.0
+    return min(d, MAX_DURATION_SEC)
+
+
 # =========================
-# Google Sheets helpers
+# Sheets helpers
 # =========================
 def gsheet_client_from_sa_json(sa_json_str: str):
     sa_info = json.loads(sa_json_str)
@@ -113,7 +118,6 @@ def sanitize_caption(s: str) -> str:
     if not s:
         return ""
     s = str(s)
-    # remove placeholders like [TOPIC], [NUMBER], {TOPIC}
     s = re.sub(r"\[[^\]]+\]", "", s)
     s = re.sub(r"\{[^}]+\}", "", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -124,7 +128,6 @@ def wrap_caption(text: str, max_chars: int = 18) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if len(text) <= max_chars:
         return text
-    # split at nearest whitespace before max_chars
     cut = max_chars
     for i in range(max_chars, max(8, max_chars - 7), -1):
         if i < len(text) and text[i] == " ":
@@ -141,11 +144,6 @@ def wrap_caption(text: str, max_chars: int = 18) -> str:
 # OpenAI helpers
 # =========================
 def make_tts_mp3(client: OpenAI, text: str, out_path: str):
-    """
-    Version-tolerant TTS:
-    - Prefer response_format="mp3"
-    - Fallback to format="mp3"
-    """
     resp = None
     try:
         resp = client.audio.speech.create(
@@ -186,11 +184,6 @@ def sora_create_and_download_mp4(
     size_fallback: str,
     out_raw_mp4: str,
 ) -> Tuple[str, str]:
-    """
-    Creates a video job with Videos API and downloads mp4.
-
-    Returns (used_size, video_id)
-    """
     last_err = None
     for size in [size_primary, size_fallback]:
         try:
@@ -217,10 +210,8 @@ def sora_create_and_download_mp4(
                 msg = getattr(getattr(video, "error", None), "message", None)
                 raise RuntimeError(f"Sora failed status={status} msg={msg}")
 
-            # Download MP4 bytes
             content = client.videos.download_content(vid, variant="video")
             content.write_to_file(out_raw_mp4)
-
             return size, vid
 
         except Exception as e:
@@ -230,9 +221,6 @@ def sora_create_and_download_mp4(
     raise RuntimeError(f"Sora create/download failed for both sizes. last_err={last_err}")
 
 
-# =========================
-# Subtitle (ASS) bottom-center, safe area
-# =========================
 def build_ass_subtitles_bottom(lines: List[str], total_dur: float, ass_path: str):
     cleaned = []
     for x in (lines or []):
@@ -244,7 +232,7 @@ def build_ass_subtitles_bottom(lines: List[str], total_dur: float, ass_path: str
         cleaned = ["wait for it...", "😂", ""]
 
     beats = cleaned[:3]
-    beats = [wrap_caption(b, SUB_MAX_CHARS_PER_LINE) for b in beats if b is not None]
+    beats = [wrap_caption(b, SUB_MAX_CHARS_PER_LINE) for b in beats]
 
     n = max(len(beats), 1)
     seg = max(total_dur / n, 1.6)
@@ -284,13 +272,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write("\n".join(events))
 
 
-# =========================
-# FFmpeg compose:
-# - input raw video (maybe landscape)
-# - scale/crop to 9:16 1080x1920
-# - burn subtitles (ASS)
-# - replace audio with TTS
-# =========================
 def compose_final_video(raw_video: str, tts_mp3: str, ass_path: str, out_mp4: str, dur: float):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
 
@@ -319,38 +300,95 @@ def compose_final_video(raw_video: str, tts_mp3: str, ass_path: str, out_mp4: st
     run(cmd)
 
 
-# =========================
-# Prompt builder: meme video prompt (no copyrighted chars)
-# =========================
 def build_meme_video_prompt(variant: Dict[str, Any], region: str) -> str:
-    vtitle = (variant.get("variant_title") or "").strip()
-    voiceover = (variant.get("voiceover") or "").strip()
-    ons = variant.get("on_screen_text") or []
-    ons = [sanitize_caption(x) for x in ons]
-    ons = [x for x in ons if x][:3]
-
-    # Prefer the existing analysis-produced video_prompt if it looks final
+    """
+    B) 強化動態感：快節奏、推鏡、手持晃動、2-3個動作、對比光
+    並強制：不要片上文字（字幕我們後加）
+    """
     vp = (variant.get("video_prompt") or "").strip()
     if vp:
-        # just add hard constraints for safety + vertical
-        return (
-            vp
-            + "\n\nConstraints: vertical 9:16, meme style, no logos, no real people, no copyrighted characters, "
-              "leave empty space near bottom for subtitles, high contrast, dynamic motion."
+        return vp + (
+            "\n\nExtra constraints:"
+            "\n- Vertical 9:16"
+            "\n- Fast meme pacing"
+            "\n- Quick push-in near punchline"
+            "\n- Slight handheld camera shake"
+            "\n- 2–3 distinct actions in the scene"
+            "\n- High contrast lighting, crisp subject"
+            "\n- NO on-screen text (subtitles will be added later)"
+            "\n- No logos, no brands, no copyrighted characters, no real people"
+            "\n- Leave clean space near bottom for subtitles"
         )
 
-    # Fallback prompt
-    hook = ons[0] if ons else (vtitle or "funny meme moment")
+    voiceover = sanitize_caption(variant.get("voiceover", ""))[:240]
     return f"""
 Vertical 9:16 meme-style short video.
-Scene: an original comedic situation, exaggerated reaction, dynamic motion.
-Tone: internet meme, funny, punchy.
-On-screen vibe: "{hook}"
+Style anchor: viral shorts meme, comedic reaction, dynamic motion, cinematic lighting.
+Scene: original comedic situation with exaggerated reaction.
+Pacing: fast, punchy.
+Camera: quick push-in near the punchline, slight handheld shake.
+Action: include 2–3 distinct actions.
 No logos, no brands, no copyrighted characters, no real people.
-Leave clean space near the bottom for subtitles.
-Lighting: high contrast, sharp, modern.
-Camera: quick push-in + slight handheld shake for punch.
+NO on-screen text (subtitles added later). Leave bottom space clean.
+Context voiceover (for vibe only): {voiceover}
+Region vibe: {region}
 """.strip()
+
+
+def generate_youtube_metadata(client: OpenAI, variant: Dict[str, Any], region: str) -> Dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "hashtags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 6},
+            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 6, "maxItems": 18},
+        },
+        "required": ["title", "description", "hashtags", "tags"],
+    }
+
+    voiceover = sanitize_caption(variant.get("voiceover", ""))[:600]
+    ons = variant.get("on_screen_text") or []
+    ons = [sanitize_caption(x) for x in ons if sanitize_caption(x)][:3]
+    vtitle = sanitize_caption(variant.get("variant_title", ""))
+
+    instruction = f"""
+You are a YouTube Shorts copywriter.
+
+Language: {YT_LANG}
+Rules:
+- Title: <= {YT_MAX_TITLE_CHARS} chars, hooky, 1 emoji max, MUST end with "#shorts"
+- No copyrighted characters, no brands, no real person names.
+- Description: 2 short lines + CTA line + hashtags line at end
+- Hashtags: 3-6, include "#shorts"
+- Tags: 6-18 keywords, no hashtags in tags
+Return STRICT JSON only.
+""".strip()
+
+    payload = {
+        "region": region,
+        "variant_title": vtitle,
+        "voiceover": voiceover,
+        "caption_beats": ons,
+    }
+
+    resp = client.responses.create(
+        model=YT_MODEL,
+        input=[
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        max_output_tokens=450,
+        response_format={
+            "type": "json_schema",
+            "name": "yt_shorts_metadata",
+            "schema": schema,
+            "strict": True,
+        },
+    )
+
+    return json.loads(resp.output_text)
 
 
 # =========================
@@ -376,6 +414,7 @@ def main():
     required = [
         "ai_status", "ai_variants_json", "video_id", "title", "region",
         "gen_status", "gen_video_file", "gen_note",
+        "yt_title", "yt_description", "yt_hashtags", "yt_tags",
     ]
     missing = [c for c in required if c not in idx]
     if missing:
@@ -403,13 +442,15 @@ def main():
     to_process = candidates[:MAX_PER_RUN_GEN]
     print(f"[INFO] Generate candidates={len(candidates)} will_process={len(to_process)} (MAX_PER_RUN_GEN={MAX_PER_RUN_GEN})", flush=True)
 
-    # batch update columns
-    cols_to_update = [idx["gen_status"], idx["gen_video_file"], idx["gen_note"]]
+    cols_to_update = [
+        idx["gen_status"], idx["gen_video_file"], idx["gen_note"],
+        idx["yt_title"], idx["yt_description"], idx["yt_hashtags"], idx["yt_tags"],
+    ]
     start_col = min(cols_to_update)
     end_col = max(cols_to_update)
     width = end_col - start_col + 1
 
-    batch_payload = []
+    payload = []
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for rnum in to_process:
@@ -423,72 +464,83 @@ def main():
         gen_status = "failed"
         gen_file = ""
         gen_note = ""
+        yt_title = ""
+        yt_desc = ""
+        yt_hashtags = ""
+        yt_tags = ""
 
-        if not variants:
-            gen_note = "No variants in ai_variants_json"
-            print(f"[WARN] row={rnum} no variants.", flush=True)
-        else:
+        try:
+            if not variants:
+                raise RuntimeError("No variants in ai_variants_json")
+
             v = variants[min(max(VARIANT_INDEX, 0), len(variants) - 1)]
-            voiceover = (v.get("voiceover") or "").strip()
+            voiceover = sanitize_caption(v.get("voiceover", "")).strip()
             on_screen = v.get("on_screen_text") or []
-            on_screen = [sanitize_caption(x) for x in on_screen]
-            on_screen = [x for x in on_screen if x]
+            on_screen = [sanitize_caption(x) for x in on_screen if sanitize_caption(x)][:4]
 
             if not voiceover:
-                gen_note = "Variant missing voiceover"
-                print(f"[WARN] row={rnum} missing voiceover.", flush=True)
+                raise RuntimeError("Variant missing voiceover")
+
+            base = f"{video_id}_sora_v{VARIANT_INDEX+1}".replace("/", "_")
+            tts_path = os.path.join(OUTPUT_DIR, f"{base}.mp3")
+            ass_path = os.path.join(OUTPUT_DIR, f"{base}.ass")
+            raw_path = os.path.join(OUTPUT_DIR, f"{base}_raw.mp4")
+            out_mp4 = os.path.join(OUTPUT_DIR, f"{base}.mp4")
+
+            # 1) TTS
+            make_tts_mp3(client, voiceover, tts_path)
+
+            # 2) Duration follow TTS, cap 20
+            dur = clamp_duration(audio_duration_sec(tts_path))
+
+            # Sora supports only 4, 8, 12 seconds → quantize to follow TTS
+            if dur <= 6:
+                seconds = 4
+            elif dur <= 10:
+                seconds = 8
             else:
-                try:
-                    base = f"{video_id}_sora_v{VARIANT_INDEX+1}".replace("/", "_")
-                    tts_path = os.path.join(OUTPUT_DIR, f"{base}.mp3")
-                    ass_path = os.path.join(OUTPUT_DIR, f"{base}.ass")
-                    raw_path = os.path.join(OUTPUT_DIR, f"{base}_raw.mp4")
-                    out_mp4 = os.path.join(OUTPUT_DIR, f"{base}.mp4")
+                seconds = 12
 
-                    # 1) TTS
-                    make_tts_mp3(client, voiceover, tts_path)
+            # Ensure we don't render longer than the generated video
+            dur = min(dur, float(seconds))
 
-                    # 2) Duration (follow TTS but quantized for Sora)
-                    dur = clamp_duration(audio_duration_sec(tts_path))
+            # 3) Subtitles safe + wrap
+            build_ass_subtitles_bottom(on_screen, dur, ass_path)
 
-                    # Sora supports only 4, 8, 12 seconds
-                    if dur <= 6:
-                        seconds = 4
-                    elif dur <= 10:
-                        seconds = 8
-                    else:
-                        seconds = 12
+            # 4) Sora text-to-video
+            prompt = build_meme_video_prompt(v, region)
+            used_size, vid = sora_create_and_download_mp4(
+                client=client,
+                prompt=prompt,
+                seconds=seconds,
+                size_primary=VIDEO_SIZE_PRIMARY,
+                size_fallback=VIDEO_SIZE_FALLBACK,
+                out_raw_mp4=raw_path,
+            )
 
-                    # Ensure final render duration doesn't exceed generated video length
-                    dur = min(dur, float(seconds))
+            # 5) Compose final 9:16 + subs + replace audio
+            compose_final_video(raw_path, tts_path, ass_path, out_mp4, dur)
 
-                    # 3) ASS subtitles (safe, wrapped, no placeholders)
-                    build_ass_subtitles_bottom(on_screen, dur, ass_path)
+            # 6) YouTube metadata
+            meta = generate_youtube_metadata(client, v, region)
+            yt_title = sanitize_caption(meta.get("title", "")).strip()
+            yt_desc = (meta.get("description", "") or "").strip()
+            hashtags_list = meta.get("hashtags") or []
+            tags_list = meta.get("tags") or []
+            yt_hashtags = " ".join([sanitize_caption(x) for x in hashtags_list if sanitize_caption(x)])
+            yt_tags = ", ".join([sanitize_caption(x) for x in tags_list if sanitize_caption(x)])
 
-                    # 4) Sora text-to-video (create -> poll -> download mp4) :contentReference[oaicite:2]{index=2}
-                    prompt = build_meme_video_prompt(v, region)
-                    used_size, vid = sora_create_and_download_mp4(
-                        client=client,
-                        prompt=prompt,
-                        seconds=seconds,
-                        size_primary=VIDEO_SIZE_PRIMARY,
-                        size_fallback=VIDEO_SIZE_FALLBACK,
-                        out_raw_mp4=raw_path,
-                    )
+            gen_status = "done"
+            gen_file = out_mp4
+            gen_note = f"ok; dur={dur:.2f}s; sora={VIDEO_MODEL}; size={used_size}; video_id={vid}; variant={VARIANT_INDEX+1}; subs_safe=1; placeholders_removed=1"
 
-                    # 5) Compose final: crop/scale to 9:16 + burn subs + replace audio
-                    compose_final_video(raw_path, tts_path, ass_path, out_mp4, dur)
+            print(f"[OK] row={rnum} video_id={video_id} status=done variant={VARIANT_INDEX+1} dur={dur:.2f}s", flush=True)
 
-                    gen_status = "done"
-                    gen_file = out_mp4
-                    gen_note = f"ok; dur={dur:.2f}s; sora_model={VIDEO_MODEL}; size={used_size}; video_id={vid}; subs_safe=1; placeholders_removed=1"
-                    print(f"[OK] row={rnum} video_id={video_id} gen=done dur={dur:.2f}s size={used_size}", flush=True)
-
-                except Exception as e:
-                    gen_status = "failed"
-                    gen_file = ""
-                    gen_note = f"error: {e}"
-                    print(f"[WARN] row={rnum} failed: {e}", flush=True)
+        except Exception as e:
+            gen_status = "failed"
+            gen_file = ""
+            gen_note = f"error: {e}"
+            print(f"[WARN] row={rnum} failed: {e}", flush=True)
 
         rowvals = [""] * width
 
@@ -498,14 +550,18 @@ def main():
         setcol(idx["gen_status"], gen_status)
         setcol(idx["gen_video_file"], gen_file)
         setcol(idx["gen_note"], gen_note)
+        setcol(idx["yt_title"], yt_title)
+        setcol(idx["yt_description"], yt_desc)
+        setcol(idx["yt_hashtags"], yt_hashtags)
+        setcol(idx["yt_tags"], yt_tags)
 
         rng = f"{a1_col(start_col)}{rnum}:{a1_col(end_col)}{rnum}"
-        batch_payload.append({"range": rng, "values": [rowvals]})
+        payload.append({"range": rng, "values": [rowvals]})
 
         time.sleep(0.6)
 
-    ws.batch_update(batch_payload, value_input_option="RAW")
-    print(f"[DONE] Updated {len(to_process)} rows gen_status.", flush=True)
+    ws.batch_update(payload, value_input_option="RAW")
+    print(f"[DONE] Updated {len(to_process)} rows gen+yt metadata.", flush=True)
 
 
 if __name__ == "__main__":
