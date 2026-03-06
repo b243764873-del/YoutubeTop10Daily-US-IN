@@ -1,8 +1,15 @@
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-gspread
-python-dateutil
-youtube-transcript-api>=0.6.2
-openai>=1.55.0
+# Stable requirements for the YouTube Shorts automation pipeline
+# Target runtime: Python 3.11
+# Pinned to reduce breakage from upstream releases.
+
+# Google / Sheets / YouTube
+google-api-python-client==2.192.0
+google-auth==2.48.0
+google-auth-oauthlib==1.3.0
+google-auth-httplib2==0.3.0
+gspread==6.2.1
+python-dateutil==2.9.0.post0
+youtube-transcript-api==1.2.4
+
+# OpenAI
+openai==2.26.0
