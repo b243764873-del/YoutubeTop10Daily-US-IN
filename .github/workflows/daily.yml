@@ -1,22 +1,73 @@
-name: Daily YouTube Shorts Radar (US+IN)
+name: Daily YouTube Shorts Radar
 
 on:
   schedule:
-    - cron: "41 5 * * *"   # Taiwan 13:41 (UTC+8)
+    - cron: "41 5 * * *" # Taiwan 13:41 (UTC+8)
   workflow_dispatch:
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+permissions:
+  contents: read
 
-      - uses: actions/setup-python@v5
+concurrency:
+  group: daily-radar-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      SHEET_NAME: daily_rank
+      TRANSCRIPT_COL: transcript
+      REGIONS: US,IN
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Preflight secrets
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          required = ["YOUTUBE_API_KEY", "GSHEET_ID", "GSHEET_SA_JSON"]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+              print(f"Missing required secrets: {missing}")
+              sys.exit(1)
+          print("Secrets preflight OK")
+          PY
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+          pip install --no-cache-dir google-api-python-client gspread google-auth youtube-transcript-api
+
+      - name: Show versions
+        run: |
+          python --version
+          python - <<'PY'
+          import gspread
+          import googleapiclient
+          print('gspread:', getattr(gspread, '__version__', 'unknown'))
+          print('googleapiclient:', getattr(googleapiclient, '__version__', 'unknown'))
+          PY
 
       - name: Run daily radar
         env:
@@ -24,3 +75,12 @@ jobs:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
         run: python main.py
+
+      - name: Upload logs/artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-radar-${{ github.run_id }}
+          path: |
+            outputs/**
+          if-no-files-found: ignore
