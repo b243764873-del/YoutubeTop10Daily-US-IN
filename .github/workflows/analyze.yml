@@ -1,57 +1,86 @@
-name: Analyze New Entries (V3 - OpenAI)
+name: Analyze Pending Entries
 
 on:
   schedule:
-    - cron: "10 4 * * *" # Taiwan 12:10 (UTC+8)
+    - cron: "55 5 * * *" # Taiwan 13:55 (UTC+8)
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: analyze-pending-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  run:
+  run-analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      SHEET_NAME: daily_rank
+      MAX_PER_RUN: "5"
+      VARIANT_COUNT: "3"
+      OPENAI_MODEL: gpt-4.1-mini
+      OPENAI_MAX_OUTPUT_TOKENS: "2200"
+      OPENAI_TIMEOUT_SEC: "75"
+      SLEEP_BETWEEN_ROWS_SEC: "0.8"
+      TRANSCRIPT_COL: transcript
+      TRANSCRIPT_MAX_CHARS: "9000"
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Preflight secrets
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          required = ["OPENAI_API_KEY", "GSHEET_ID", "GSHEET_SA_JSON"]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+              print(f"Missing required secrets: {missing}")
+              sys.exit(1)
+          print("Secrets preflight OK")
+          PY
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
-          pip install --upgrade --no-cache-dir openai gspread google-auth youtube-transcript-api
-          python -c "import openai; print('openai version:', openai.__version__)"
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+          pip install --no-cache-dir "openai>=1.55.0" gspread google-auth youtube-transcript-api
+
       - name: Show versions
         run: |
-          python -c "import openai; print('openai version:', openai.__version__)"
+          python --version
+          python - <<'PY'
+          import openai, gspread
+          print('openai:', getattr(openai, '__version__', 'unknown'))
+          print('gspread:', getattr(gspread, '__version__', 'unknown'))
+          PY
 
       - name: Run analyzer
         env:
-          # Required
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
-
-          # Tuning knobs (optional)
-          SHEET_NAME: daily_rank
-          MAX_PER_RUN: 5
-          VARIANT_COUNT: 10
-          OPENAI_MODEL: gpt-4.1-mini
-          OPENAI_MAX_OUTPUT_TOKENS: 3200
-          OPENAI_TIMEOUT_SEC: 75
-          SLEEP_BETWEEN_ROWS_SEC: 0.8
-          AI_FILTER_ENABLED: 1
-          AI_MIN_SCORE: 3
-          AI_CLASSIFY_ENABLED: 1
-          AI_CLASSIFY_MODEL: gpt-4.1-mini
-          AI_CLASSIFY_MAX_TOKENS: 220
-          AI_CLASSIFY_MIN_CONFIDENCE: 60
-          AI_CLASSIFY_SLEEP_SEC: 0.3
-          AI_VISUAL_ENABLED: 1
-          AI_VISUAL_MODEL: gpt-4.1-mini
-          AI_VISUAL_MAX_TOKENS: 220
-          AI_VISUAL_MIN_CONFIDENCE: 55
         run: python analyze_pending.py
+
+      - name: Upload logs/artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-pending-${{ github.run_id }}
+          path: |
+            outputs/**
+          if-no-files-found: ignore
