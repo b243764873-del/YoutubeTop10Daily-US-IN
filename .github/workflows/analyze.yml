@@ -2,7 +2,7 @@ name: Analyze Pending Entries
 
 on:
   schedule:
-    - cron: "55 5 * * *" # Taiwan 13:55 (UTC+8)
+ #   - cron: "55 5 * * *" # Taiwan 13:55 (UTC+8)
   workflow_dispatch:
 
 permissions:
