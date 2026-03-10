@@ -2,7 +2,7 @@ name: Daily YouTube Shorts Radar
 
 on:
   schedule:
-    - cron: "41 5 * * *" # Taiwan 13:41 (UTC+8)
+  #  - cron: "41 5 * * *" # Taiwan 13:41 (UTC+8)
   workflow_dispatch:
 
 permissions:
