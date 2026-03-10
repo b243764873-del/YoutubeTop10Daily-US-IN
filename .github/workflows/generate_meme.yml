@@ -2,7 +2,7 @@ name: Generate Meme Shorts
 
 on:
   schedule:
-    - cron: "20 6 * * *" # Taiwan 14:20 (UTC+8)
+  #  - cron: "20 6 * * *" # Taiwan 14:20 (UTC+8)
   workflow_dispatch:
 
 permissions:
